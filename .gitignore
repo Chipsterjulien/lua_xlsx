@@ -1,0 +1,5 @@
+# Fichiers temporaires du harnais d'auto-test
+._xlsx_selftest.xlsx
+
+# Fichiers de test/sortie éventuels
+*.tmp
