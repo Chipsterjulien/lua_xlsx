@@ -12,7 +12,11 @@ constituent la cible principale et recommandée.
 ## Points forts
 
 - Écriture de classeurs XLSX : chaînes, nombres, booléens, dates, dates-heures,
-  plusieurs feuilles et cellules éparses.
+  formules, plusieurs feuilles et cellules éparses.
+- Styles simples : gras, italique, couleurs, fond, alignement, retour à la
+  ligne et formats numériques personnalisés ou prédéfinis.
+- Mise en page : largeurs de colonnes, hauteurs de lignes, volets figés et
+  filtres automatiques.
 - Lecture des ZIP XLSX STORED ou DEFLATE avec un décompresseur DEFLATE Lua.
 - Contrôle du CRC-32, des tailles, des offsets, des doublons, du chiffrement,
   des chevauchements et des rapports de compression.
@@ -52,8 +56,21 @@ local xlsx = require("xlsx")
 local wb = xlsx.new()
 local sh = wb:add_sheet("Rapport")
 
-sh:append_row({ "Nom", "Âge", "Actif", "Date" })
-sh:append_row({ "Alice", 30, true, xlsx.date(2026, 7, 18) })
+local header = xlsx.style({
+  bold = true,
+  fill_color = "D9EAF7",
+  horizontal = "center",
+})
+local money = xlsx.style({ number_format = "currency_eur" })
+
+sh:append_row({ "Nom", "Montant", "Date", "Total" }, header)
+sh:append_row({ "Alice", 12.5, xlsx.date(2026, 7, 18) })
+sh:write(1, 1, 12.5, money)
+sh:write(2, 3, xlsx.formula("SUM(B2:B2)"), money)
+sh:set_column_width(0, 18)
+sh:set_row_height(0, 24)
+sh:freeze_panes(1, 1)
+sh:set_auto_filter("A1:D2")
 
 local ok, err = wb:save("rapport.xlsx")
 assert(ok, err)
@@ -183,9 +200,12 @@ fichiers Markdown. Il nécessite Pandoc et XeLaTeX ou LuaLaTeX.
 
 ## Limites actuelles
 
-- Pas de styles visuels généraux, de cellules fusionnées ni d'écriture de
-  formules.
-- La valeur mise en cache d'une formule peut être lue, pas la formule elle-même.
+- Pas de cellules fusionnées, graphiques, images, validations de données ni
+  mise en forme conditionnelle.
+- Les formules peuvent être écrites, mais lua-xlsx ne les calcule pas et ne lit
+  pas encore leur expression. Seule une éventuelle valeur mise en cache est lue.
+- Les styles et réglages de présentation sont produits en écriture, mais ne sont
+  pas exposés par l'API de lecture.
 - La lecture reste en mémoire : le ZIP, les XML utiles et les résultats
   décompressés sont chargés en RAM dans les limites configurées.
 - Le lecteur Lua ne prend pas encore en charge ZIP64. Babet peut valider un ZIP64,

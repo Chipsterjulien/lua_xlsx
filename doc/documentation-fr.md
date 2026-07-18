@@ -3,11 +3,14 @@
 Référence des modules `xlsx` et `dataframe`. La cible principale est Babet avec
 Lua 5.5, mais le cœur reste compatible avec Lua standard 5.3+.
 
+Documentation de lua-xlsx 1.1.0.
+
 ## Table des matières
 
 - [Architecture et intégration Babet](#architecture-et-intégration-babet)
 - [Conventions](#conventions)
 - [Écriture XLSX](#écriture-xlsx)
+- [Styles, mise en page et formules](#styles-mise-en-page-et-formules)
 - [Dates 1900 et 1904](#dates-1900-et-1904)
 - [Lecture XLSX](#lecture-xlsx)
 - [Limites et validation ZIP](#limites-et-validation-zip)
@@ -52,7 +55,7 @@ il est généralement préférable de conserver la valeur par défaut `true`.
 
 ## Conventions
 
-- `sheet:write(row, col, value)` et `sheet:read(row, col)` utilisent des indices
+- `sheet:write(row, col, value [, style])` et `sheet:read(row, col)` utilisent des indices
   **0-based**. `A1` correspond à `(0, 0)`.
 - `sheet:rows()` produit des lignes Lua **1-based**. `row[1]` correspond à la
   colonne A et `row.n` indique la largeur.
@@ -111,7 +114,7 @@ local fr = wb:add_sheet("Données")
 local unicode = wb:add_sheet(string.rep("é", 20))
 ```
 
-### `sheet:write(row, col, value) -> sheet`
+### `sheet:write(row, col, value [, style]) -> sheet`
 
 Types acceptés :
 
@@ -119,7 +122,8 @@ Types acceptés :
 - entier ou flottant fini ;
 - `boolean` ;
 - valeur créée par `xlsx.date` ou `xlsx.datetime` ;
-- `nil` pour une cellule vide.
+- formule créée par `xlsx.formula` ;
+- `nil` pour une cellule vide, éventuellement stylée.
 
 ```lua
 local sh = xlsx.new():add_sheet("Exemple")
@@ -128,12 +132,13 @@ sh:write(0, 1, 42)
 sh:write(0, 2, 3.14)
 sh:write(0, 3, false)
 sh:write(0, 4, xlsx.date(2026, 7, 18))
+sh:write(0, 5, xlsx.formula("SUM(B1:C1)"))
 ```
 
 `NaN`, les infinis, les types non pris en charge, les indices négatifs et les
 indices hors limites Excel lèvent une erreur Lua.
 
-### `sheet:append_row(values) -> sheet`
+### `sheet:append_row(values [, style]) -> sheet`
 
 Ajoute une ligne après la dernière ligne connue.
 
@@ -145,7 +150,7 @@ sh:append_row({ "Bob", 25, false })
 Les `nil` terminaux ne peuvent pas être distingués de l'absence d'élément dans
 un tableau Lua. Pour écrire une cellule éloignée, utiliser `write()`.
 
-### `sheet:write_rows(matrix) -> sheet`
+### `sheet:write_rows(matrix [, style]) -> sheet`
 
 Ajoute une matrice complète :
 
@@ -156,6 +161,281 @@ sh:write_rows({
   { "Bob", 15 },
 })
 ```
+
+## Styles, mise en page et formules
+
+Les fonctions de cette section concernent l'écriture. L'API de lecture renvoie
+les valeurs des cellules, mais n'expose pas encore les styles, les dimensions,
+les filtres ni les expressions de formules.
+
+### `xlsx.VERSION`
+
+La version du module est disponible sous forme de chaîne :
+
+```lua
+assert(xlsx.VERSION == "1.1.0")
+```
+
+### `xlsx.style([opts]) -> style`
+
+Crée un style réutilisable et immuable. Un style doit être créé avec
+`xlsx.style`; une table d'options brute n'est pas acceptée par `write()`.
+
+| Option | Type | Valeurs |
+|---|---|---|
+| `bold` | booléen | police grasse |
+| `italic` | booléen | police italique |
+| `font_color` | chaîne | RGB `RRGGBB`, `#RRGGBB` ou ARGB `AARRGGBB` |
+| `fill_color` | chaîne | fond plein RGB ou ARGB |
+| `horizontal` | chaîne | `left`, `center`, `right`, `justify` |
+| `vertical` | chaîne | `top`, `center`, `bottom`, `justify` |
+| `wrap_text` | booléen | retour automatique à la ligne |
+| `number_format` | chaîne | alias documenté ou code de format Excel |
+
+Les couleurs RGB à six chiffres reçoivent automatiquement un canal alpha
+opaque `FF`.
+
+Police grasse :
+
+```lua
+local bold = xlsx.style({ bold = true })
+sh:write(0, 0, "Important", bold)
+```
+
+Italique et couleur de police :
+
+```lua
+local note = xlsx.style({
+  italic = true,
+  font_color = "7F6000",
+})
+sh:write(1, 0, "Note", note)
+```
+
+Fond plein :
+
+```lua
+local warning = xlsx.style({ fill_color = "FFF2CC" })
+sh:write(2, 0, "Attention", warning)
+```
+
+Alignement horizontal :
+
+```lua
+local centered = xlsx.style({ horizontal = "center" })
+sh:write(3, 0, "Centré", centered)
+```
+
+Alignement vertical et retour à la ligne :
+
+```lua
+local wrapped = xlsx.style({
+  vertical = "center",
+  wrap_text = true,
+})
+sh:write(4, 0, "Texte long sur plusieurs lignes", wrapped)
+```
+
+Formats numériques prédéfinis :
+
+| Alias | Code Excel produit |
+|---|---|
+| `general` | aucun format personnalisé |
+| `integer` | `0` |
+| `decimal` | `0.00` |
+| `percent` | `0.00%` |
+| `currency_eur` | `#,##0.00 "€"` |
+| `currency_usd` | `$#,##0.00` |
+| `date` | `yyyy-mm-dd` |
+| `datetime` | `yyyy-mm-dd hh:mm:ss` |
+
+Un alias par usage :
+
+```lua
+sh:write(0, 1, 42, xlsx.style({ number_format = "integer" }))
+sh:write(1, 1, 3.14159, xlsx.style({ number_format = "decimal" }))
+sh:write(2, 1, 0.125, xlsx.style({ number_format = "percent" }))
+sh:write(3, 1, 19.90, xlsx.style({ number_format = "currency_eur" }))
+```
+
+Un code Excel personnalisé est également accepté :
+
+```lua
+local code = xlsx.style({ number_format = '0.000 "kg"' })
+sh:write(4, 1, 12.3456, code)
+```
+
+Les valeurs `xlsx.date` et `xlsx.datetime` reçoivent automatiquement leur
+format date si le style fourni ne définit pas déjà `number_format`. Il est donc
+possible de combiner gras et date sans perdre le format calendaire :
+
+```lua
+local date_bold = xlsx.style({ bold = true })
+sh:write(0, 2, xlsx.date(2026, 7, 18), date_bold)
+```
+
+Exemple combiné de style d'en-tête :
+
+```lua
+local header = xlsx.style({
+  bold = true,
+  font_color = "FFFFFF",
+  fill_color = "4472C4",
+  horizontal = "center",
+  vertical = "center",
+  wrap_text = true,
+})
+sh:append_row({ "Produit", "Prix", "Date" }, header)
+```
+
+### `sheet:set_style(row, col, style) -> sheet`
+
+Applique un style après l'écriture, ou à une cellule vide :
+
+```lua
+sh:write(0, 0, "Titre")
+sh:set_style(0, 0, xlsx.style({ bold = true }))
+
+-- cellule vide mais colorée
+sh:set_style(1, 0, xlsx.style({ fill_color = "E2F0D9" }))
+```
+
+Passer `nil` retire le style enregistré pour cette cellule :
+
+```lua
+sh:set_style(0, 0, nil)
+```
+
+### `sheet:set_column_width(col, width) -> sheet`
+
+`col` est 0-based. La largeur doit être un nombre fini compris entre `0.1` et
+`255` unités Excel.
+
+```lua
+sh:set_column_width(0, 24) -- colonne A
+sh:set_column_width(1, 14) -- colonne B
+```
+
+### `sheet:set_row_height(row, height) -> sheet`
+
+`row` est 0-based. La hauteur est exprimée en points et doit être comprise entre
+`0.1` et `409.5`.
+
+```lua
+sh:set_row_height(0, 28)
+```
+
+### `sheet:freeze_panes(rows, cols) -> sheet`
+
+`rows` et `cols` sont le nombre de lignes et de colonnes à conserver visibles
+depuis le coin supérieur gauche.
+
+Figer seulement la première ligne :
+
+```lua
+sh:freeze_panes(1, 0) -- première cellule libre : A2
+```
+
+Figer seulement la première colonne :
+
+```lua
+sh:freeze_panes(0, 1) -- première cellule libre : B1
+```
+
+Figer la première ligne et la première colonne :
+
+```lua
+sh:freeze_panes(1, 1) -- première cellule libre : B2
+```
+
+`freeze_panes(0, 0)` supprime le gel.
+
+### `sheet:set_auto_filter([range]) -> sheet`
+
+Sans argument, le filtre couvre la zone utilisée au moment de la sauvegarde :
+
+```lua
+sh:set_auto_filter()
+```
+
+Une plage explicite doit être rectangulaire, en notation A1, dans l'ordre
+coin supérieur gauche vers coin inférieur droit :
+
+```lua
+sh:set_auto_filter("A1:D100")
+```
+
+Passer `false` désactive le filtre :
+
+```lua
+sh:set_auto_filter(false)
+```
+
+Cette fonction ajoute les boutons de filtre Excel. Elle ne filtre pas les
+lignes dans le fichier produit.
+
+### `xlsx.formula(expression) -> formula`
+
+Crée une formule destinée à l'écriture. Le signe `=` initial est facultatif :
+
+```lua
+sh:write(3, 1, xlsx.formula("SUM(B1:B3)"))
+sh:write(3, 2, xlsx.formula("=AVERAGE(C1:C3)"))
+```
+
+La formule est stockée dans le classeur, mais lua-xlsx ne possède pas de moteur
+de calcul. Il n'écrit donc pas de résultat mis en cache. Excel, LibreOffice ou
+un autre tableur calcule la formule à l'ouverture. Un lecteur utilisant le mode
+`data_only` peut voir `nil` tant que le classeur n'a pas été recalculé et
+sauvegardé par un tableur.
+
+Une formule peut recevoir un style comme toute autre cellule :
+
+```lua
+local money = xlsx.style({ number_format = "currency_eur" })
+sh:write(10, 3, xlsx.formula("SUM(D2:D10)"), money)
+```
+
+### Exemple complet de rapport présenté
+
+```lua
+local xlsx = require("xlsx")
+
+local wb = xlsx.new()
+local sh = wb:add_sheet("Ventes")
+
+local header = xlsx.style({
+  bold = true,
+  font_color = "FFFFFF",
+  fill_color = "4472C4",
+  horizontal = "center",
+  vertical = "center",
+  wrap_text = true,
+})
+local money = xlsx.style({ number_format = "currency_eur" })
+
+sh:append_row({ "Produit", "Prix", "Quantité", "Total" }, header)
+sh:append_row({ "Clavier", 39.90, 2 })
+sh:append_row({ "Souris", 24.50, 3 })
+
+sh:write(1, 1, 39.90, money)
+sh:write(2, 1, 24.50, money)
+sh:write(1, 3, xlsx.formula("B2*C2"), money)
+sh:write(2, 3, xlsx.formula("B3*C3"), money)
+sh:write(3, 3, xlsx.formula("SUM(D2:D3)"), money)
+
+sh:set_column_width(0, 24)
+sh:set_column_width(1, 14)
+sh:set_column_width(2, 12)
+sh:set_column_width(3, 16)
+sh:set_row_height(0, 28)
+sh:freeze_panes(1, 1)
+sh:set_auto_filter("A1:D3")
+
+assert(wb:save("ventes.xlsx"))
+```
+
+---
 
 ### `workbook:save(path [, opts]) -> true, nil | nil, err`
 
@@ -618,6 +898,8 @@ Le harnais vérifie notamment :
 - chaînes Unicode et entités XML ;
 - CRC corrompu ;
 - systèmes de dates 1900 et 1904 ;
+- styles, formats numériques et dates stylées ;
+- largeurs, hauteurs, volets figés, filtres et formules ;
 - limites Excel et XML 1.0 ;
 - appels automatiques à Babet ;
 - non-destruction des DataFrames ;
@@ -679,8 +961,12 @@ temporaire et ne laisse pas les fichiers auxiliaires LaTeX dans le projet.
 
 - Écriture ZIP STORED uniquement ; lecture STORED et DEFLATE.
 - Pas de ZIP64 dans le parseur Lua interne.
-- Pas de styles visuels généraux, cellules fusionnées ou écriture de formules.
-- La valeur mise en cache d'une formule peut être lue.
+- Pas de cellules fusionnées, graphiques, images, validations de données ni mise
+  en forme conditionnelle.
+- Les formules peuvent être écrites, mais lua-xlsx ne les calcule pas et ne lit
+  pas encore leur expression. Seule une éventuelle valeur mise en cache est lue.
+- Les styles, dimensions, volets et filtres sont produits en écriture, mais ne
+  sont pas exposés par l'API de lecture.
 - Pas de lecture en streaming : le fichier et les XML utiles restent en mémoire.
 - Parsing XML spécialisé au sous-ensemble XLSX utilisé, pas parseur XML général.
 - Pas de normalisation Unicode ou de case folding Unicode complet pour les noms

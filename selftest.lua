@@ -239,6 +239,82 @@ do
   _G.babet = original
 end
 
+
+-- ---- PRÉSENTATION ET FORMULES ----------------------------------------------
+print("\n[7] styles, dimensions, volets, filtres et formules")
+do
+  check(xlsx.VERSION == "1.1.0", "version du module 1.1.0")
+  local header = xlsx.style({
+    bold = true,
+    fill_color = "D9EAF7",
+    font_color = "112233",
+    horizontal = "center",
+    vertical = "center",
+    wrap_text = true,
+  })
+  local money = xlsx.style({ number_format = "currency_eur" })
+  local date_bold = xlsx.style({ bold = true })
+
+  local wb = xlsx.new()
+  local sh = wb:add_sheet("Présentation")
+  sh:append_row({ "Nom", "Montant", "Date", "Total" }, header)
+  sh:append_row({ "Alice", 12.5, xlsx.date(2024, 3, 15) })
+  sh:write(1, 1, 12.5, money)
+  sh:write(1, 2, xlsx.date(2024, 3, 15), date_bold)
+  sh:append_row({ "Bob", 7.25, xlsx.date(2024, 3, 16) })
+  sh:write(2, 1, 7.25, money)
+  sh:write(2, 2, xlsx.date(2024, 3, 16), date_bold)
+  sh:write(3, 3, xlsx.formula("=SUM(B2:B3)"), money)
+  sh:set_style(4, 0, header)
+  sh:set_column_width(0, 18)
+  sh:set_column_width(1, 14)
+  sh:set_row_height(0, 24)
+  sh:freeze_panes(1, 1)
+  sh:set_auto_filter("A1:D3")
+  assert(wb:save(TMP2, { use_babet = false }))
+
+  local bytes = read_file(TMP2)
+  check(bytes:find('<pane xSplit="1" ySplit="1" topLeftCell="B2"', 1, true) ~= nil,
+    "volets figés sérialisés")
+  check(bytes:find('<autoFilter ref="A1:D3"/>', 1, true) ~= nil,
+    "filtre automatique sérialisé")
+  check(bytes:find('<col min="1" max="1" width="18" customWidth="1"/>', 1, true) ~= nil,
+    "largeur de colonne sérialisée")
+  check(bytes:find('<row r="1" ht="24" customHeight="1">', 1, true) ~= nil,
+    "hauteur de ligne sérialisée")
+  check(bytes:find('<f>SUM(B2:B3)</f>', 1, true) ~= nil,
+    "formule sérialisée sans signe égal")
+  check(bytes:find('<b/>', 1, true) ~= nil and bytes:find('fgColor rgb="FFD9EAF7"', 1, true) ~= nil,
+    "police grasse et fond sérialisés")
+  check(bytes:find('formatCode="#,##0.00 &quot;€&quot;"', 1, true) ~= nil,
+    "format monétaire sérialisé")
+  check(bytes:find('horizontal="center" vertical="center" wrapText="1"', 1, true) ~= nil,
+    "alignement et retour à la ligne sérialisés")
+
+  local reread = assert(xlsx.open(TMP2, { use_babet = false }))
+  check(assert(reread:sheet("Présentation")):read(1, 2) == "2024-03-15",
+    "date stylée relue comme date")
+
+  expect_error(function() xlsx.style({ bold = "oui" }) end,
+    "style refuse un booléen invalide")
+  expect_error(function() xlsx.style({ fill_color = "rouge" }) end,
+    "style refuse une couleur invalide")
+  expect_error(function() xlsx.formula(42) end,
+    "formula exige une string")
+  expect_error(function() xlsx.formula("=") end,
+    "formule vide refusée")
+  expect_error(function() xlsx.new():add_sheet("x"):write(0, 0, 1, {}) end,
+    "write refuse une table de style brute")
+  expect_error(function() xlsx.new():add_sheet("x"):set_column_width(0, 256) end,
+    "largeur de colonne hors limite refusée")
+  expect_error(function() xlsx.new():add_sheet("x"):set_row_height(0, 410) end,
+    "hauteur de ligne hors limite refusée")
+  expect_error(function() xlsx.new():add_sheet("x"):freeze_panes(-1, 0) end,
+    "nombre de lignes figées invalide refusé")
+  expect_error(function() xlsx.new():add_sheet("x"):set_auto_filter("D3:A1") end,
+    "plage de filtre inversée refusée")
+end
+
 os.remove(TMP)
 os.remove(TMP2)
 os.remove(BAD)

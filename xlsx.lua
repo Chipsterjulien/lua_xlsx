@@ -21,7 +21,7 @@
 --- d'archive et d'écriture atomique. Sans Babet, un chemin de repli Lua pur
 --- conserve l'API et applique ses propres contrôles de taille, CRC et ZIP.
 
-local xlsx = {}
+local xlsx = { VERSION = "1.1.0" }
 
 local function get_babet()
   local runtime = rawget(_G, "babet")
@@ -99,9 +99,13 @@ local function validate_xml_document(s, what)
   return s
 end
 
-local function esc(s)
-  validate_xml_text(s, "texte de cellule", 3)
+local function esc_xml(s, what, level)
+  validate_xml_text(s, what or "texte XML", level or 3)
   return (s:gsub('[&<>"]', XML_ESC))
+end
+
+local function esc(s)
+  return esc_xml(s, "texte de cellule", 3)
 end
 
 -- colonne 0-indexée -> lettres ("A", "B", ..., "AA", ...)
@@ -240,6 +244,282 @@ function xlsx.date_to_serial(y, m, d, h, mi, sec, date1904)
 end
 
 -- ----------------------------------------------------------------------------
+-- Formules et styles d'écriture
+-- ----------------------------------------------------------------------------
+local FORMULA_MT, STYLE_MT = {}, {}
+local FORMULA_DATA = setmetatable({}, { __mode = "k" })
+local STYLE_DATA = setmetatable({}, { __mode = "k" })
+
+FORMULA_MT.__index = function(self, key)
+  local data = FORMULA_DATA[self]
+  return data and data[key] or nil
+end
+FORMULA_MT.__newindex = function()
+  error("xlsx: une formule est immuable", 2)
+end
+
+STYLE_MT.__index = function(self, key)
+  local data = STYLE_DATA[self]
+  return data and data[key] or nil
+end
+STYLE_MT.__newindex = function()
+  error("xlsx: un style est immuable", 2)
+end
+
+--- Crée une formule. Le signe = initial est facultatif.
+function xlsx.formula(expression)
+  if type(expression) ~= "string" then error("xlsx: formula attend une string", 2) end
+  validate_xml_text(expression, "formule", 3)
+  if expression:sub(1, 1) == "=" then expression = expression:sub(2) end
+  if expression == "" then error("xlsx: une formule ne peut pas être vide", 2) end
+  local obj = setmetatable({}, FORMULA_MT)
+  FORMULA_DATA[obj] = { expression = expression }
+  return obj
+end
+
+local NUMBER_FORMAT_ALIASES = {
+  general = nil,
+  integer = "0",
+  decimal = "0.00",
+  percent = "0.00%",
+  currency_eur = '#,##0.00 "€"',
+  currency_usd = '$#,##0.00',
+  date = "yyyy-mm-dd",
+  datetime = "yyyy-mm-dd hh:mm:ss",
+}
+
+local function normalize_color(value, what, level)
+  if value == nil then return nil end
+  if type(value) ~= "string" then error("xlsx: " .. what .. " doit être une couleur RGB/ARGB", level or 3) end
+  if value:match("^#%x%x%x%x%x%x$") then value = value:sub(2) end
+  if value:match("^%x%x%x%x%x%x$") then value = "FF" .. value end
+  if not value:match("^%x%x%x%x%x%x%x%x$") then
+    error("xlsx: " .. what .. " doit contenir 6 chiffres RGB ou 8 chiffres ARGB", level or 3)
+  end
+  return value:upper()
+end
+
+local function normalize_style(opts, level)
+  if type(opts) ~= "table" then error("xlsx: style attend une table d'options", level or 3) end
+  local allowed = {
+    bold=true, italic=true, font_color=true, fill_color=true,
+    horizontal=true, vertical=true, wrap_text=true, number_format=true,
+  }
+  for k in pairs(opts) do
+    if not allowed[k] then error("xlsx: option de style inconnue : " .. tostring(k), level or 3) end
+  end
+  local out = {}
+  for _, key in ipairs({ "bold", "italic", "wrap_text" }) do
+    local value = opts[key]
+    if value ~= nil and type(value) ~= "boolean" then
+      error("xlsx: " .. key .. " doit être un booléen", level or 3)
+    end
+    out[key] = value == true
+  end
+  out.font_color = normalize_color(opts.font_color, "font_color", level or 3)
+  out.fill_color = normalize_color(opts.fill_color, "fill_color", level or 3)
+  if opts.horizontal ~= nil then
+    local allowed_h = { left=true, center=true, right=true, justify=true }
+    if type(opts.horizontal) ~= "string" or not allowed_h[opts.horizontal] then
+      error("xlsx: horizontal doit valoir left, center, right ou justify", level or 3)
+    end
+    out.horizontal = opts.horizontal
+  end
+  if opts.vertical ~= nil then
+    local allowed_v = { top=true, center=true, bottom=true, justify=true }
+    if type(opts.vertical) ~= "string" or not allowed_v[opts.vertical] then
+      error("xlsx: vertical doit valoir top, center, bottom ou justify", level or 3)
+    end
+    out.vertical = opts.vertical
+  end
+  if opts.number_format ~= nil then
+    if type(opts.number_format) ~= "string" or opts.number_format == "" then
+      error("xlsx: number_format doit être une string non vide", level or 3)
+    end
+    validate_xml_text(opts.number_format, "format numérique", level or 3)
+    if #opts.number_format > 255 then error("xlsx: number_format dépasse 255 octets", level or 3) end
+    if NUMBER_FORMAT_ALIASES[opts.number_format] ~= nil or opts.number_format == "general" then
+      out.number_format = NUMBER_FORMAT_ALIASES[opts.number_format]
+    else
+      out.number_format = opts.number_format
+    end
+  end
+  return out
+end
+
+--- Crée un style réutilisable et immuable.
+function xlsx.style(opts)
+  local data = normalize_style(opts or {}, 3)
+  local obj = setmetatable({}, STYLE_MT)
+  STYLE_DATA[obj] = data
+  return obj
+end
+
+local function require_style(style, level)
+  if style == nil then return nil end
+  if getmetatable(style) ~= STYLE_MT or not STYLE_DATA[style] then
+    error("xlsx: le style doit être créé avec xlsx.style", level or 3)
+  end
+  return STYLE_DATA[style]
+end
+
+local function key_part(value)
+  value = value == nil and "" or tostring(value)
+  return #value .. ":" .. value
+end
+
+local function style_key(data)
+  return table.concat({
+    data.bold and "1" or "0", data.italic and "1" or "0",
+    key_part(data.font_color), key_part(data.fill_color),
+    key_part(data.horizontal), key_part(data.vertical),
+    data.wrap_text and "1" or "0", key_part(data.number_format),
+  }, "|")
+end
+
+local function copy_style_data(data)
+  return {
+    bold = data.bold, italic = data.italic, font_color = data.font_color,
+    fill_color = data.fill_color, horizontal = data.horizontal,
+    vertical = data.vertical, wrap_text = data.wrap_text,
+    number_format = data.number_format,
+  }
+end
+
+local function new_style_registry()
+  local reg = {
+    fonts = { { bold=false, italic=false, color=nil } },
+    font_map = { ["0|0|"] = 0 },
+    fills = { { kind="none" }, { kind="gray125" } },
+    fill_map = {},
+    numfmts = {}, numfmt_map = {},
+    xfs = { { fontId=0, fillId=0, numFmtId=0 } },
+    xf_map = {},
+  }
+  reg.xf_map[style_key({ bold=false, italic=false, wrap_text=false })] = 0
+  return reg
+end
+
+local function register_font(reg, data)
+  local key = (data.bold and "1" or "0") .. "|" .. (data.italic and "1" or "0") .. "|" .. (data.font_color or "")
+  local id = reg.font_map[key]
+  if id ~= nil then return id end
+  id = #reg.fonts
+  reg.fonts[#reg.fonts + 1] = { bold=data.bold, italic=data.italic, color=data.font_color }
+  reg.font_map[key] = id
+  return id
+end
+
+local function register_fill(reg, color)
+  if not color then return 0 end
+  local id = reg.fill_map[color]
+  if id ~= nil then return id end
+  id = #reg.fills
+  reg.fills[#reg.fills + 1] = { kind="solid", color=color }
+  reg.fill_map[color] = id
+  return id
+end
+
+local function register_numfmt(reg, code)
+  if not code then return 0 end
+  local id = reg.numfmt_map[code]
+  if id then return id end
+  id = 163 + #reg.numfmts + 1
+  reg.numfmts[#reg.numfmts + 1] = { id=id, code=code }
+  reg.numfmt_map[code] = id
+  return id
+end
+
+local function register_style(reg, data)
+  local key = style_key(data)
+  local known = reg.xf_map[key]
+  if known ~= nil then return known end
+  local fontId = register_font(reg, data)
+  local fillId = register_fill(reg, data.fill_color)
+  local numFmtId = register_numfmt(reg, data.number_format)
+  local id = #reg.xfs
+  reg.xfs[#reg.xfs + 1] = {
+    fontId=fontId, fillId=fillId, numFmtId=numFmtId,
+    horizontal=data.horizontal, vertical=data.vertical, wrap_text=data.wrap_text,
+  }
+  reg.xf_map[key] = id
+  return id
+end
+
+local function effective_style_data(style, value)
+  local source = style and STYLE_DATA[style] or nil
+  local data = source and copy_style_data(source)
+    or { bold=false, italic=false, wrap_text=false }
+  if getmetatable(value) == DATE_MT and not data.number_format then
+    data.number_format = value.kind == "datetime"
+      and NUMBER_FORMAT_ALIASES.datetime or NUMBER_FORMAT_ALIASES.date
+  end
+  return data
+end
+
+local function build_styles_xml(reg)
+  local b = {}
+  b[#b + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+  b[#b + 1] = '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+  if #reg.numfmts > 0 then
+    b[#b + 1] = '<numFmts count="' .. #reg.numfmts .. '">'
+    for _, fmt in ipairs(reg.numfmts) do
+      b[#b + 1] = '<numFmt numFmtId="' .. fmt.id .. '" formatCode="' ..
+        esc_xml(fmt.code, "format numérique", 0) .. '"/>'
+    end
+    b[#b + 1] = '</numFmts>'
+  end
+  b[#b + 1] = '<fonts count="' .. #reg.fonts .. '">'
+  for _, font in ipairs(reg.fonts) do
+    b[#b + 1] = '<font>'
+    if font.bold then b[#b + 1] = '<b/>' end
+    if font.italic then b[#b + 1] = '<i/>' end
+    if font.color then b[#b + 1] = '<color rgb="' .. font.color .. '"/>' end
+    b[#b + 1] = '<sz val="11"/><name val="Calibri"/></font>'
+  end
+  b[#b + 1] = '</fonts>'
+  b[#b + 1] = '<fills count="' .. #reg.fills .. '">'
+  for _, fill in ipairs(reg.fills) do
+    if fill.kind == "none" then
+      b[#b + 1] = '<fill><patternFill patternType="none"/></fill>'
+    elseif fill.kind == "gray125" then
+      b[#b + 1] = '<fill><patternFill patternType="gray125"/></fill>'
+    else
+      b[#b + 1] = '<fill><patternFill patternType="solid"><fgColor rgb="' .. fill.color ..
+        '"/><bgColor indexed="64"/></patternFill></fill>'
+    end
+  end
+  b[#b + 1] = '</fills>'
+  b[#b + 1] = '<borders count="1"><border/></borders>'
+  b[#b + 1] = '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+  b[#b + 1] = '<cellXfs count="' .. #reg.xfs .. '">'
+  for _, xf in ipairs(reg.xfs) do
+    local attrs = {
+      'numFmtId="' .. xf.numFmtId .. '"', 'fontId="' .. xf.fontId .. '"',
+      'fillId="' .. xf.fillId .. '"', 'borderId="0"', 'xfId="0"',
+    }
+    if xf.numFmtId ~= 0 then attrs[#attrs + 1] = 'applyNumberFormat="1"' end
+    if xf.fontId ~= 0 then attrs[#attrs + 1] = 'applyFont="1"' end
+    if xf.fillId ~= 0 then attrs[#attrs + 1] = 'applyFill="1"' end
+    local has_alignment = xf.horizontal or xf.vertical or xf.wrap_text
+    if has_alignment then attrs[#attrs + 1] = 'applyAlignment="1"' end
+    if has_alignment then
+      b[#b + 1] = '<xf ' .. table.concat(attrs, " ") .. '><alignment'
+      if xf.horizontal then b[#b + 1] = ' horizontal="' .. xf.horizontal .. '"' end
+      if xf.vertical then b[#b + 1] = ' vertical="' .. xf.vertical .. '"' end
+      if xf.wrap_text then b[#b + 1] = ' wrapText="1"' end
+      b[#b + 1] = '/></xf>'
+    else
+      b[#b + 1] = '<xf ' .. table.concat(attrs, " ") .. '/>'
+    end
+  end
+  b[#b + 1] = '</cellXfs>'
+  b[#b + 1] = '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+  b[#b + 1] = '</styleSheet>'
+  return table.concat(b)
+end
+
+-- ----------------------------------------------------------------------------
 -- Worksheet
 -- ----------------------------------------------------------------------------
 local Sheet = {}
@@ -249,9 +529,15 @@ local function new_sheet(name, workbook)
   return setmetatable({
     name   = name,
     cells  = {},   -- cells[row][col] = valeur Lua brute
+    styles = {},   -- styles[row][col] = objet xlsx.style
+    row_heights = {},
+    column_widths = {},
     maxrow = -1,
     maxcol = -1,
     _workbook = workbook,
+    _freeze_rows = 0,
+    _freeze_cols = 0,
+    _auto_filter = false,
   }, Sheet)
 end
 
@@ -264,13 +550,28 @@ local function check_index(v, what, level)
   end
 end
 
---- Écrit une cellule. row/col sont 0-indexés. value : string|number|boolean|nil.
-function Sheet:write(row, col, value)
+local function check_finite_number(value, what, min, max, level)
+  if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge
+      or value < min or value > max then
+    error(string.format("xlsx: %s doit être un nombre fini entre %s et %s", what, min, max), level or 3)
+  end
+end
+
+local function ensure_cell_extent(sheet, row, col)
+  if row > sheet.maxrow then sheet.maxrow = row end
+  if col > sheet.maxcol then sheet.maxcol = col end
+end
+
+--- Écrit une cellule. row/col sont 0-indexés.
+--- value : string|number|boolean|date|formula|nil. style est facultatif.
+function Sheet:write(row, col, value, style)
   check_index(row, "row", 3)
   check_index(col, "col", 3)
+  require_style(style, 3)
   local t = type(value)
-  if t == "table" and getmetatable(value) == DATE_MT then
-    -- valeur date : acceptée telle quelle
+  local mt = t == "table" and getmetatable(value) or nil
+  if mt == DATE_MT or mt == FORMULA_MT then
+    -- valeur taggée : acceptée telle quelle
   elseif value ~= nil and t ~= "string" and t ~= "number" and t ~= "boolean" then
     error("xlsx: type de cellule non supporté : " .. t, 2)
   elseif t == "string" then
@@ -282,23 +583,107 @@ function Sheet:write(row, col, value)
   local r = self.cells[row]
   if not r then r = {}; self.cells[row] = r end
   r[col] = value
-  if value ~= nil then
-    if row > self.maxrow then self.maxrow = row end
-    if col > self.maxcol then self.maxcol = col end
+  if style ~= nil then
+    local sr = self.styles[row]
+    if not sr then sr = {}; self.styles[row] = sr end
+    sr[col] = style
+  end
+  if value ~= nil or style ~= nil then ensure_cell_extent(self, row, col) end
+  return self
+end
+
+--- Applique ou retire le style d'une cellule, y compris une cellule vide.
+function Sheet:set_style(row, col, style)
+  check_index(row, "row", 3)
+  check_index(col, "col", 3)
+  require_style(style, 3)
+  local sr = self.styles[row]
+  if style == nil then
+    if sr then sr[col] = nil end
+  else
+    if not sr then sr = {}; self.styles[row] = sr end
+    sr[col] = style
+    ensure_cell_extent(self, row, col)
   end
   return self
 end
 
---- Ajoute une ligne complète à la suite (les nil en fin de table sont ignorés).
-function Sheet:append_row(values)
+--- Définit la largeur d'une colonne 0-indexée, en unités Excel.
+function Sheet:set_column_width(col, width)
+  check_index(col, "col", 3)
+  check_finite_number(width, "largeur de colonne", 0.1, 255, 3)
+  self.column_widths[col] = width
+  return self
+end
+
+--- Définit la hauteur d'une ligne 0-indexée, en points.
+function Sheet:set_row_height(row, height)
+  check_index(row, "row", 3)
+  check_finite_number(height, "hauteur de ligne", 0.1, 409.5, 3)
+  self.row_heights[row] = height
+  if row > self.maxrow then self.maxrow = row end
+  return self
+end
+
+--- Fige un nombre de lignes et de colonnes à partir du coin supérieur gauche.
+function Sheet:freeze_panes(rows, cols)
+  rows, cols = rows or 0, cols or 0
+  if math.type(rows) ~= "integer" or rows < 0 or rows > MAX_ROW then
+    error("xlsx: rows doit être un entier entre 0 et " .. MAX_ROW, 2)
+  end
+  if math.type(cols) ~= "integer" or cols < 0 or cols > MAX_COL then
+    error("xlsx: cols doit être un entier entre 0 et " .. MAX_COL, 2)
+  end
+  self._freeze_rows, self._freeze_cols = rows, cols
+  return self
+end
+
+local function validate_filter_ref(ref)
+  if type(ref) ~= "string" then error("xlsx: la plage de filtre doit être une string A1:B2", 3) end
+  local c1, r1, c2, r2 = ref:match("^([A-Za-z]+)(%d+):([A-Za-z]+)(%d+)$")
+  if not c1 then error("xlsx: plage de filtre invalide : " .. ref, 3) end
+  -- Validation locale : le parseur de références de lecture est défini plus bas.
+  local function col_number(letters)
+    local n = 0
+    for i = 1, #letters do
+      local byte = letters:upper():byte(i)
+      if byte < 65 or byte > 90 then return nil end
+      n = n * 26 + byte - 64
+    end
+    return n - 1
+  end
+  local a, b = col_number(c1), col_number(c2)
+  local x, y = tonumber(r1), tonumber(r2)
+  if not a or not b or a < 0 or b > MAX_COL or x < 1 or y > MAX_ROW + 1 or a > b or x > y then
+    error("xlsx: plage de filtre hors limites ou inversée : " .. ref, 3)
+  end
+  return c1:upper() .. x .. ":" .. c2:upper() .. y
+end
+
+--- Active un filtre automatique. Sans plage, utilise la zone de données courante.
+--- Passer false désactive le filtre.
+function Sheet:set_auto_filter(ref)
+  if ref == false then
+    self._auto_filter = false
+  elseif ref == nil then
+    self._auto_filter = true
+  else
+    self._auto_filter = validate_filter_ref(ref)
+  end
+  return self
+end
+
+--- Ajoute une ligne complète à la suite. Un style facultatif s'applique aux valeurs présentes.
+function Sheet:append_row(values, style)
   if type(values) ~= "table" then
     error("xlsx: append_row attend une table", 2)
   end
+  require_style(style, 3)
   local row = self.maxrow + 1
   local n = #values
   for i = 1, n do
     local v = values[i]
-    if v ~= nil then self:write(row, i - 1, v) end
+    if v ~= nil then self:write(row, i - 1, v, style) end
   end
   -- garantir que la ligne existe même si entièrement vide
   if not self.cells[row] then self.cells[row] = {} end
@@ -306,15 +691,34 @@ function Sheet:append_row(values)
   return self
 end
 
---- Écrit une matrice (table de tables) à partir de la position courante.
-function Sheet:write_rows(matrix)
+--- Écrit une matrice. Un style facultatif s'applique à toutes les valeurs présentes.
+function Sheet:write_rows(matrix, style)
   if type(matrix) ~= "table" then
     error("xlsx: write_rows attend une table de lignes", 2)
   end
+  require_style(style, 3)
   for i = 1, #matrix do
-    self:append_row(matrix[i])
+    self:append_row(matrix[i], style)
   end
   return self
+end
+
+local function style_attr(id)
+  return id ~= 0 and (' s="' .. id .. '"') or ""
+end
+
+local function freeze_pane_xml(rows, cols)
+  if rows == 0 and cols == 0 then return nil end
+  local attrs = {}
+  if cols > 0 then attrs[#attrs + 1] = 'xSplit="' .. cols .. '"' end
+  if rows > 0 then attrs[#attrs + 1] = 'ySplit="' .. rows .. '"' end
+  attrs[#attrs + 1] = 'topLeftCell="' .. col_ref(cols) .. (rows + 1) .. '"'
+  local pane = rows > 0 and cols > 0 and "bottomRight"
+    or (rows > 0 and "bottomLeft" or "topRight")
+  attrs[#attrs + 1] = 'activePane="' .. pane .. '"'
+  attrs[#attrs + 1] = 'state="frozen"'
+  return '<sheetViews><sheetView workbookViewId="0"><pane ' ..
+    table.concat(attrs, " ") .. '/></sheetView></sheetViews>'
 end
 
 -- sérialise la feuille en XML ; alimente sst (liste) et sst_index (map)
@@ -325,41 +729,78 @@ function Sheet:_xml(sst, sst_index)
   if self.maxrow >= 0 and self.maxcol >= 0 then
     b[#b + 1] = '<dimension ref="A1:' .. col_ref(self.maxcol) .. (self.maxrow + 1) .. '"/>'
   end
+  local pane = freeze_pane_xml(self._freeze_rows, self._freeze_cols)
+  if pane then b[#b + 1] = pane end
+  if next(self.column_widths) then
+    b[#b + 1] = '<cols>'
+    local cols = {}
+    for col in pairs(self.column_widths) do cols[#cols + 1] = col end
+    table.sort(cols)
+    for _, col in ipairs(cols) do
+      b[#b + 1] = '<col min="' .. (col + 1) .. '" max="' .. (col + 1) ..
+        '" width="' .. num2str(self.column_widths[col]) .. '" customWidth="1"/>'
+    end
+    b[#b + 1] = '</cols>'
+  end
   b[#b + 1] = '<sheetData>'
   for r = 0, self.maxrow do
     local rowcells = self.cells[r]
-    if rowcells then
-      b[#b + 1] = '<row r="' .. (r + 1) .. '">'
+    local rowstyles = self.styles[r]
+    if rowcells or rowstyles or self.row_heights[r] then
+      local rowattrs = { 'r="' .. (r + 1) .. '"' }
+      if self.row_heights[r] then
+        rowattrs[#rowattrs + 1] = 'ht="' .. num2str(self.row_heights[r]) .. '"'
+        rowattrs[#rowattrs + 1] = 'customHeight="1"'
+      end
+      b[#b + 1] = '<row ' .. table.concat(rowattrs, " ") .. '>'
       for c = 0, self.maxcol do
-        local v = rowcells[c]
-        if v ~= nil then
+        local v, style
+        if rowcells then v = rowcells[c] end
+        if rowstyles then style = rowstyles[c] end
+        if v ~= nil or style ~= nil then
           local ref = col_ref(c) .. (r + 1)
+          local sid = self._workbook:_style_id(style, v)
+          local sattr = style_attr(sid)
           local tv = type(v)
-          if tv == "table" then -- valeur date taggée
-            local style = (v.kind == "datetime") and 2 or 1
+          local mt = tv == "table" and getmetatable(v) or nil
+          if mt == DATE_MT then
             local date1904 = self._workbook and self._workbook._date1904 or false
             local serial = ymd_to_serial(v.y, v.m, v.d, v.h, v.mi, v.s, date1904)
-            b[#b + 1] = '<c r="' .. ref .. '" s="' .. style .. '"><v>' ..
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. '><v>' ..
               num2str(serial) .. '</v></c>'
+          elseif mt == FORMULA_MT then
+            local formula = FORMULA_DATA[v].expression
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. '><f>' ..
+              esc_xml(formula, "formule", 0) .. '</f></c>'
           elseif tv == "string" then
             local idx = sst_index[v]
-            if not idx then
+            if idx == nil then
               idx = #sst
               sst[#sst + 1] = v
               sst_index[v] = idx
             end
-            b[#b + 1] = '<c r="' .. ref .. '" t="s"><v>' .. idx .. '</v></c>'
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. ' t="s"><v>' .. idx .. '</v></c>'
           elseif tv == "boolean" then
-            b[#b + 1] = '<c r="' .. ref .. '" t="b"><v>' .. (v and "1" or "0") .. '</v></c>'
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. ' t="b"><v>' .. (v and "1" or "0") .. '</v></c>'
+          elseif tv == "number" then
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. '><v>' .. num2str(v) .. '</v></c>'
           else
-            b[#b + 1] = '<c r="' .. ref .. '"><v>' .. num2str(v) .. '</v></c>'
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. '/>'
           end
         end
       end
       b[#b + 1] = '</row>'
     end
   end
-  b[#b + 1] = '</sheetData></worksheet>'
+  b[#b + 1] = '</sheetData>'
+  local filter_ref
+  if self._auto_filter == true and self.maxrow >= 0 and self.maxcol >= 0 then
+    filter_ref = 'A1:' .. col_ref(self.maxcol) .. (self.maxrow + 1)
+  elseif type(self._auto_filter) == "string" then
+    filter_ref = self._auto_filter
+  end
+  if filter_ref then b[#b + 1] = '<autoFilter ref="' .. filter_ref .. '"/>' end
+  b[#b + 1] = '</worksheet>'
   return table.concat(b)
 end
 
@@ -368,6 +809,12 @@ end
 -- ----------------------------------------------------------------------------
 local Workbook = {}
 Workbook.__index = Workbook
+
+function Workbook:_style_id(style, value)
+  require_style(style, 3)
+  if not self._style_registry then error("xlsx: registre de styles indisponible", 2) end
+  return register_style(self._style_registry, effective_style_data(style, value))
+end
 
 function xlsx.new(opts)
   opts = opts or {}
@@ -379,7 +826,10 @@ function xlsx.new(opts)
   if date_system ~= "1900" and date_system ~= "1904" then
     error("xlsx: date_system doit valoir '1900' ou '1904'", 2)
   end
-  return setmetatable({ sheets = {}, _date1904 = date_system == "1904", _sheet_names = {} }, Workbook)
+  return setmetatable({
+    sheets = {}, _date1904 = date_system == "1904", _sheet_names = {},
+    _style_registry = nil,
+  }, Workbook)
 end
 
 function Workbook:add_sheet(name)
@@ -404,6 +854,7 @@ end
 -- construit la liste des parties ZIP {name=, data=}
 function Workbook:_parts()
   local nsheets = #self.sheets
+  self._style_registry = new_style_registry()
   local sst, sst_index = {}, {}
   local sheet_xmls = {}
   for i = 1, nsheets do
@@ -447,7 +898,7 @@ function Workbook:_parts()
     if self._date1904 then t[#t + 1] = '<workbookPr date1904="1"/>' end
     t[#t + 1] = '<sheets>'
     for i = 1, nsheets do
-      t[#t + 1] = '<sheet name="' .. esc(self.sheets[i].name) ..
+      t[#t + 1] = '<sheet name="' .. esc_xml(self.sheets[i].name, "nom de feuille", 0) ..
         '" sheetId="' .. i .. '" r:id="rId' .. i .. '"/>'
     end
     t[#t + 1] = '</sheets></workbook>'
@@ -490,27 +941,9 @@ function Workbook:_parts()
     add("xl/sharedStrings.xml", table.concat(t))
   end
 
-  -- xl/styles.xml  (3 styles : 0 = général, 1 = date, 2 = date-heure)
-  add("xl/styles.xml", table.concat({
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
-    '<numFmts count="2">',
-    '<numFmt numFmtId="164" formatCode="yyyy-mm-dd"/>',
-    '<numFmt numFmtId="165" formatCode="yyyy-mm-dd hh:mm:ss"/>',
-    '</numFmts>',
-    '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>',
-    '<fills count="2"><fill><patternFill patternType="none"/></fill>',
-    '<fill><patternFill patternType="gray125"/></fill></fills>',
-    '<borders count="1"><border/></borders>',
-    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>',
-    '<cellXfs count="3">',
-    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>',
-    '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',
-    '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',
-    '</cellXfs>',
-    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>',
-    '</styleSheet>',
-  }))
+  -- xl/styles.xml : styles dynamiques, dates incluses
+  add("xl/styles.xml", build_styles_xml(self._style_registry))
+  self._style_registry = nil
 
   return parts
 end
@@ -647,9 +1080,10 @@ end
 -- ============================================================================
 -- LECTURE
 -- ============================================================================
--- v1 : valeurs (string / number / boolean), sharedStrings, inlineStr, plusieurs
--- feuilles, cellules éparses. Hors v1 lecture : styles, dates typées, formules
--- (la valeur cachée d'une formule EST lue), formats de nombre.
+-- Lecture : valeurs (string / number / boolean), dates via styles, sharedStrings,
+-- inlineStr, plusieurs feuilles et cellules éparses. Les expressions de formule
+-- et les réglages de présentation ne sont pas encore exposés ; seule une valeur
+-- de formule mise en cache peut être lue.
 
 -- ----------------------------------------------------------------------------
 -- INFLATE (RFC 1951) — décompression DEFLATE brute, en Lua pur
