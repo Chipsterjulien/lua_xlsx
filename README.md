@@ -16,9 +16,16 @@ constituent la cible principale et recommandée.
 - Styles : gras, italique, soulignement, texte barré, police, taille,
   couleurs, fond, alignement, retour à la ligne, bordures et formats numériques.
 - Structure et mise en page : cellules fusionnées, largeurs de colonnes,
-  hauteurs de lignes, volets figés et filtres automatiques.
-- Hyperliens externes et internes.
-- Lecture des formules, styles, dimensions, fusions, volets, filtres et liens.
+  hauteurs de lignes, volets figés, filtres automatiques, lignes et colonnes
+  masquées, couleur d'onglet et visibilité des feuilles.
+- Validations de données : listes, nombres, dates, heures, longueurs de texte
+  et formules personnalisées.
+- Mise en forme conditionnelle simple : comparaisons, texte, cellules vides,
+  doublons et formules personnalisées.
+- Commentaires de cellules, hyperliens externes et internes, feuille active
+  et plages nommées globales ou locales.
+- Lecture des formules, styles, dimensions, fusions, volets, filtres, liens,
+  validations, règles conditionnelles, commentaires et propriétés de feuilles.
 - Lecture des ZIP XLSX STORED ou DEFLATE avec un décompresseur DEFLATE Lua.
 - Contrôle du CRC-32, des tailles, des offsets, des doublons, du chiffrement,
   des chevauchements et des rapports de compression.
@@ -82,6 +89,21 @@ sh:set_column_width(0, 18)
 sh:set_row_height(0, 28)
 sh:freeze_panes(2, 1)
 sh:set_auto_filter("A2:D3")
+sh:add_data_validation("A3:A100", {
+  type = "list",
+  values = { "Oui", "Non", "En attente" },
+})
+sh:add_conditional_format("B3:B100", {
+  type = "cell",
+  operator = "less_than",
+  value = 0,
+  style = xlsx.style({ font_color = "9C0006", fill_color = "FFC7CE" }),
+})
+sh:set_comment(2, 0, { author = "Julien", text = "Valeur contrôlée." })
+sh:set_column_hidden(4, true)
+sh:set_tab_color("4472C4")
+wb:define_name("ZoneMontants", "'Rapport'!$B$3:$B$100")
+wb:set_active_sheet("Rapport")
 
 local ok, err = wb:save("rapport.xlsx")
 assert(ok, err)
@@ -118,6 +140,11 @@ local style = sh:get_style(0, 0)
 local frozen_rows, frozen_cols = sh:get_frozen_panes()
 print(style and style.font_name, frozen_rows, frozen_cols)
 print(table.concat(sh:merged_cells(), ", "))
+print(sh:get_tab_color(), sh:get_visibility())
+print(#sh:get_data_validations(), #sh:get_conditional_formats())
+local comment = sh:get_comment(2, 0)
+print(comment and comment.author, comment and comment.text)
+print(wb:get_active_sheet(), #wb:get_defined_names())
 ```
 
 Les dates sont renvoyées sous forme ISO 8601, par exemple `2026-07-18` ou
@@ -222,8 +249,13 @@ fichiers Markdown. Il nécessite Pandoc et XeLaTeX ou LuaLaTeX.
 
 ## Limites actuelles
 
-- Pas de graphiques, images, validations de données, tableaux structurés ni
-  mise en forme conditionnelle.
+- Pas de graphiques, images, tableaux structurés, tableaux croisés dynamiques
+  ni macros XLSM.
+- La mise en forme conditionnelle se limite aux règles simples documentées ;
+  les barres de données, jeux d'icônes et échelles de couleurs ne sont pas pris
+  en charge.
+- Les commentaires sont lus et écrits comme du texte simple : les fragments
+  riches, dimensions et positions personnalisées ne sont pas conservés.
 - Les formules sont lues et écrites, mais lua-xlsx ne les calcule pas. Une
   formule partagée sans expression résolue peut être inspectée mais pas
   réécrite directement.

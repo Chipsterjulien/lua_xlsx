@@ -21,7 +21,7 @@
 --- d'archive et d'écriture atomique. Sans Babet, un chemin de repli Lua pur
 --- conserve l'API et applique ses propres contrôles de taille, CRC et ZIP.
 
-local xlsx = { VERSION = "1.2.0" }
+local xlsx = { VERSION = "1.3.0" }
 
 local function get_babet()
   local runtime = rawget(_G, "babet")
@@ -363,6 +363,23 @@ function xlsx.is_hyperlink(value)
   return getmetatable(value) == HYPERLINK_MT and HYPERLINK_DATA[value] ~= nil
 end
 
+local function shallow_copy(src)
+  local out = {}
+  for k, v in pairs(src or {}) do out[k] = v end
+  return out
+end
+
+local function dense_array(value, what, level)
+  if type(value) ~= "table" then error("xlsx: " .. what .. " doit être une table dense", level or 3) end
+  local n = #value
+  for k in pairs(value) do
+    if math.type(k) ~= "integer" or k < 1 or k > n then
+      error("xlsx: " .. what .. " doit être une table dense 1..n", level or 3)
+    end
+  end
+  return n
+end
+
 local NUMBER_FORMAT_ALIASES = {
   general = nil,
   integer = "0",
@@ -572,6 +589,7 @@ local function new_style_registry()
     numfmts = {}, numfmt_map = {},
     xfs = { { fontId=0, fillId=0, borderId=0, numFmtId=0 } },
     xf_map = {},
+    dxfs = {}, dxf_map = {},
   }
   reg.font_map[table.concat({"0","0",key_part(nil),"0",key_part("Calibri"),key_part(11),key_part(nil)}, "|")] = 0
   reg.xf_map[style_key({ bold=false, italic=false, strike=false, wrap_text=false })] = 0
@@ -643,6 +661,16 @@ local function register_style(reg, data)
     horizontal=data.horizontal, vertical=data.vertical, wrap_text=data.wrap_text,
   }
   reg.xf_map[key] = id
+  return id
+end
+
+local function register_dxf(reg, data)
+  local key = style_key(data)
+  local known = reg.dxf_map[key]
+  if known ~= nil then return known end
+  local id = #reg.dxfs
+  reg.dxfs[#reg.dxfs + 1] = copy_style_data(data)
+  reg.dxf_map[key] = id
   return id
 end
 
@@ -735,6 +763,56 @@ local function build_styles_xml(reg)
   end
   b[#b + 1] = '</cellXfs>'
   b[#b + 1] = '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+  if #reg.dxfs > 0 then
+    b[#b + 1] = '<dxfs count="' .. #reg.dxfs .. '">'
+    for _, data in ipairs(reg.dxfs) do
+      b[#b + 1] = '<dxf>'
+      if data.bold or data.italic or data.underline or data.strike or data.font_name or data.font_size or data.font_color then
+        b[#b + 1] = '<font>'
+        if data.bold then b[#b + 1] = '<b/>' end
+        if data.italic then b[#b + 1] = '<i/>' end
+        if data.underline == "single" then b[#b + 1] = '<u/>' end
+        if data.underline == "double" then b[#b + 1] = '<u val="double"/>' end
+        if data.strike then b[#b + 1] = '<strike/>' end
+        if data.font_color then b[#b + 1] = '<color rgb="' .. data.font_color .. '"/>' end
+        if data.font_size then b[#b + 1] = '<sz val="' .. num2str(data.font_size) .. '"/>' end
+        if data.font_name then b[#b + 1] = '<name val="' .. esc_xml(data.font_name, "nom de police", 0) .. '"/>' end
+        b[#b + 1] = '</font>'
+      end
+      if data.fill_color then
+        b[#b + 1] = '<fill><patternFill patternType="solid"><fgColor rgb="' .. data.fill_color ..
+          '"/><bgColor indexed="64"/></patternFill></fill>'
+      end
+      if data.border then
+        b[#b + 1] = '<border>'
+        for _, side in ipairs({ "left", "right", "top", "bottom" }) do
+          local item = data.border[side]
+          if item then
+            b[#b + 1] = '<' .. side .. ' style="' .. item.style .. '">'
+            if item.color then b[#b + 1] = '<color rgb="' .. item.color .. '"/>' end
+            b[#b + 1] = '</' .. side .. '>'
+          else
+            b[#b + 1] = '<' .. side .. '/>'
+          end
+        end
+        b[#b + 1] = '<diagonal/></border>'
+      end
+      if data.number_format then
+        local id = register_numfmt(reg, data.number_format)
+        b[#b + 1] = '<numFmt numFmtId="' .. id .. '" formatCode="' ..
+          esc_xml(data.number_format, "format conditionnel", 0) .. '"/>'
+      end
+      if data.horizontal or data.vertical or data.wrap_text then
+        b[#b + 1] = '<alignment'
+        if data.horizontal then b[#b + 1] = ' horizontal="' .. data.horizontal .. '"' end
+        if data.vertical then b[#b + 1] = ' vertical="' .. data.vertical .. '"' end
+        if data.wrap_text then b[#b + 1] = ' wrapText="1"' end
+        b[#b + 1] = '/>'
+      end
+      b[#b + 1] = '</dxf>'
+    end
+    b[#b + 1] = '</dxfs>'
+  end
   b[#b + 1] = '</styleSheet>'
   return table.concat(b)
 end
@@ -802,13 +880,20 @@ local function new_sheet(name, workbook)
     hyperlinks = {},
     row_heights = {},
     column_widths = {},
+    row_hidden = {},
+    column_hidden = {},
     merged_ranges = {},
+    data_validations = {},
+    conditional_formats = {},
+    comments = {},
     maxrow = -1,
     maxcol = -1,
     _workbook = workbook,
     _freeze_rows = 0,
     _freeze_cols = 0,
     _auto_filter = false,
+    _tab_color = nil,
+    _visibility = "visible",
   }, Sheet)
 end
 
@@ -993,6 +1078,269 @@ function Sheet:unmerge_cells(ref)
   error("xlsx: fusion introuvable : " .. normalized, 2)
 end
 
+local DATA_VALIDATION_TYPES = {
+  list="list", whole="whole", decimal="decimal", date="date", time="time",
+  text_length="textLength", custom="custom",
+}
+local VALIDATION_OPERATORS = {
+  between="between", not_between="notBetween", equal="equal", not_equal="notEqual",
+  greater_than="greaterThan", less_than="lessThan",
+  greater_or_equal="greaterThanOrEqual", less_or_equal="lessThanOrEqual",
+}
+local VALIDATION_OPERATOR_FROM_XML = {}
+for k, v in pairs(VALIDATION_OPERATORS) do VALIDATION_OPERATOR_FROM_XML[v] = k end
+
+local function validate_optional_text(value, what, max_bytes, level)
+  if value == nil then return nil end
+  if type(value) ~= "string" then error("xlsx: " .. what .. " doit être une string", level or 3) end
+  validate_xml_text(value, what, level or 3)
+  if #value > max_bytes then error("xlsx: " .. what .. " dépasse " .. max_bytes .. " octets", level or 3) end
+  return value
+end
+
+local function validation_operand(value, what, level)
+  if value == nil then return nil end
+  if getmetatable(value) == DATE_MT then return value end
+  if type(value) == "number" then
+    if value ~= value or value == math.huge or value == -math.huge then
+      error("xlsx: " .. what .. " doit être fini", level or 3)
+    end
+    return value
+  end
+  if type(value) ~= "string" or value == "" then
+    error("xlsx: " .. what .. " doit être un nombre, une date ou une formule string non vide", level or 3)
+  end
+  validate_xml_text(value, what, level or 3)
+  return value:sub(1, 1) == "=" and value:sub(2) or value
+end
+
+local function normalize_data_validation(ref, opts, level)
+  local _, _, _, _, normalized = parse_a1_range(ref, "plage de validation", true, level or 3)
+  if type(opts) ~= "table" then error("xlsx: les options de validation doivent être une table", level or 3) end
+  local allowed = {
+    type=true, values=true, formula=true, operator=true, minimum=true, maximum=true, value=true,
+    allow_blank=true, show_input_message=true, show_error_message=true, show_dropdown=true,
+    prompt_title=true, prompt=true, error_title=true, error=true, error_style=true,
+  }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option de validation inconnue : " .. tostring(k), level or 3) end end
+  local kind = opts.type
+  if type(kind) ~= "string" or not DATA_VALIDATION_TYPES[kind] then
+    error("xlsx: type de validation inconnu", level or 3)
+  end
+  local out = { ref=normalized, type=kind }
+  for _, key in ipairs({"allow_blank", "show_input_message", "show_error_message", "show_dropdown"}) do
+    if opts[key] ~= nil and type(opts[key]) ~= "boolean" then error("xlsx: " .. key .. " doit être un booléen", level or 3) end
+    out[key] = opts[key]
+  end
+  out.allow_blank = out.allow_blank == true
+  out.show_input_message = out.show_input_message == true
+  out.show_error_message = out.show_error_message == true
+  out.show_dropdown = out.show_dropdown ~= false
+  out.prompt_title = validate_optional_text(opts.prompt_title, "titre d'aide", 32, level)
+  out.prompt = validate_optional_text(opts.prompt, "message d'aide", 255, level)
+  out.error_title = validate_optional_text(opts.error_title, "titre d'erreur", 32, level)
+  out.error = validate_optional_text(opts.error, "message d'erreur", 255, level)
+  if opts.error_style ~= nil then
+    if opts.error_style ~= "stop" and opts.error_style ~= "warning" and opts.error_style ~= "information" then
+      error("xlsx: error_style doit valoir stop, warning ou information", level or 3)
+    end
+    out.error_style = opts.error_style
+  end
+  if kind == "list" then
+    if opts.values ~= nil and opts.formula ~= nil then error("xlsx: list accepte values ou formula, pas les deux", level or 3) end
+    if opts.values ~= nil then
+      local n = dense_array(opts.values, "values", level)
+      if n == 0 then error("xlsx: values ne peut pas être vide", level or 3) end
+      local values = {}
+      for i = 1, n do
+        local item = opts.values[i]
+        if type(item) ~= "string" or item == "" then error("xlsx: chaque choix doit être une string non vide", level or 3) end
+        validate_xml_text(item, "choix de validation", level or 3)
+        if item:find('[,"]') then error("xlsx: un choix inline ne peut contenir ni virgule ni guillemet", level or 3) end
+        values[i] = item
+      end
+      local joined = table.concat(values, ",")
+      if #joined + 2 > 255 then error("xlsx: la liste inline dépasse 255 octets", level or 3) end
+      out.values, out.formula1 = values, '"' .. joined .. '"'
+    else
+      out.formula1 = validation_operand(opts.formula, "formule de liste", level)
+      if not out.formula1 then error("xlsx: une validation list exige values ou formula", level or 3) end
+    end
+  elseif kind == "custom" then
+    out.formula1 = validation_operand(opts.formula, "formule personnalisée", level)
+    if type(out.formula1) ~= "string" then error("xlsx: custom exige formula string", level or 3) end
+  else
+    local op = opts.operator or ((opts.minimum ~= nil or opts.maximum ~= nil) and "between" or "equal")
+    if not VALIDATION_OPERATORS[op] then error("xlsx: opérateur de validation inconnu", level or 3) end
+    out.operator = op
+    if op == "between" or op == "not_between" then
+      out.formula1 = validation_operand(opts.minimum, "minimum", level)
+      out.formula2 = validation_operand(opts.maximum, "maximum", level)
+      if out.formula1 == nil or out.formula2 == nil then error("xlsx: between exige minimum et maximum", level or 3) end
+    else
+      out.formula1 = validation_operand(opts.value, "valeur", level)
+      if out.formula1 == nil then error("xlsx: cet opérateur exige value", level or 3) end
+    end
+  end
+  return out
+end
+
+function Sheet:add_data_validation(ref, opts)
+  self.data_validations[#self.data_validations + 1] = normalize_data_validation(ref, opts, 3)
+  return self
+end
+
+function Sheet:remove_data_validation(ref)
+  local _, _, _, _, normalized = parse_a1_range(ref, "plage de validation", true, 3)
+  for i = #self.data_validations, 1, -1 do
+    if self.data_validations[i].ref == normalized then table.remove(self.data_validations, i) end
+  end
+  return self
+end
+
+local function copy_validation(v)
+  local out = shallow_copy(v)
+  if v.values then out.values = { table.unpack(v.values) } end
+  return out
+end
+
+function Sheet:get_data_validations()
+  local out = {}
+  for i, v in ipairs(self.data_validations) do out[i] = copy_validation(v) end
+  return out
+end
+
+local CF_OPERATORS = VALIDATION_OPERATORS
+local CF_TYPE_TO_XML = {
+  cell="cellIs", contains_text="containsText", blanks="containsBlanks",
+  not_blanks="notContainsBlanks", duplicate="duplicateValues", custom="expression",
+}
+local CF_TYPE_FROM_XML = {}
+for k, v in pairs(CF_TYPE_TO_XML) do CF_TYPE_FROM_XML[v] = k end
+
+local function top_left_ref(normalized)
+  return normalized:match("^([^:]+)")
+end
+
+local function excel_quote(text)
+  return '"' .. text:gsub('"', '""') .. '"'
+end
+
+local function normalize_conditional_format(ref, opts, level)
+  local _, _, _, _, normalized = parse_a1_range(ref, "plage conditionnelle", true, level or 3)
+  if type(opts) ~= "table" then error("xlsx: les options conditionnelles doivent être une table", level or 3) end
+  local allowed = { type=true, operator=true, value=true, minimum=true, maximum=true, formula=true,
+    text=true, style=true, stop_if_true=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option conditionnelle inconnue : " .. tostring(k), level or 3) end end
+  local kind = opts.type
+  if type(kind) ~= "string" or not CF_TYPE_TO_XML[kind] then error("xlsx: type conditionnel inconnu", level or 3) end
+  local style_data = require_style(opts.style, level or 3)
+  if not style_data then error("xlsx: un format conditionnel exige style", level or 3) end
+  if style_data.number_format or style_data.horizontal or style_data.vertical or style_data.wrap_text then
+    error("xlsx: les formats conditionnels acceptent police, fond et bordures, pas number_format/alignment", level or 3)
+  end
+  if opts.stop_if_true ~= nil and type(opts.stop_if_true) ~= "boolean" then error("xlsx: stop_if_true doit être un booléen", level or 3) end
+  local out = { ref=normalized, type=kind, style=opts.style, stop_if_true=opts.stop_if_true == true }
+  local first = top_left_ref(normalized)
+  if kind == "cell" then
+    local op = opts.operator
+    if not CF_OPERATORS[op] then error("xlsx: opérateur conditionnel inconnu", level or 3) end
+    out.operator = op
+    if op == "between" or op == "not_between" then
+      out.formula1 = validation_operand(opts.minimum, "minimum conditionnel", level)
+      out.formula2 = validation_operand(opts.maximum, "maximum conditionnel", level)
+      if out.formula1 == nil or out.formula2 == nil then error("xlsx: between exige minimum et maximum", level or 3) end
+    else
+      out.formula1 = validation_operand(opts.value, "valeur conditionnelle", level)
+      if out.formula1 == nil then error("xlsx: l'opérateur conditionnel exige value", level or 3) end
+    end
+  elseif kind == "contains_text" then
+    local text = validate_optional_text(opts.text, "texte conditionnel", 255, level)
+    if not text or text == "" then error("xlsx: contains_text exige text", level or 3) end
+    out.text = text
+    out.formula1 = 'NOT(ISERROR(SEARCH(' .. excel_quote(text) .. ',' .. first .. ')))'
+  elseif kind == "blanks" then
+    out.formula1 = 'LEN(TRIM(' .. first .. '))=0'
+  elseif kind == "not_blanks" then
+    out.formula1 = 'LEN(TRIM(' .. first .. '))>0'
+  elseif kind == "custom" then
+    out.formula1 = validation_operand(opts.formula, "formule conditionnelle", level)
+    if type(out.formula1) ~= "string" then error("xlsx: custom exige formula string", level or 3) end
+  end
+  return out
+end
+
+function Sheet:add_conditional_format(ref, opts)
+  self.conditional_formats[#self.conditional_formats + 1] = normalize_conditional_format(ref, opts, 3)
+  return self
+end
+
+function Sheet:remove_conditional_format(ref)
+  local _, _, _, _, normalized = parse_a1_range(ref, "plage conditionnelle", true, 3)
+  for i = #self.conditional_formats, 1, -1 do
+    if self.conditional_formats[i].ref == normalized then table.remove(self.conditional_formats, i) end
+  end
+  return self
+end
+
+local function copy_conditional_format(v)
+  return shallow_copy(v)
+end
+
+function Sheet:get_conditional_formats()
+  local out = {}
+  for i, v in ipairs(self.conditional_formats) do out[i] = copy_conditional_format(v) end
+  return out
+end
+
+function Sheet:set_comment(row, col, comment)
+  check_index(row, "row", 3); check_index(col, "col", 3)
+  if type(comment) ~= "table" then error("xlsx: comment doit être une table {author,text}", 2) end
+  for k in pairs(comment) do if k ~= "author" and k ~= "text" then error("xlsx: option de commentaire inconnue : " .. tostring(k), 2) end end
+  local author = validate_optional_text(comment.author, "auteur du commentaire", 255, 3)
+  local text = validate_optional_text(comment.text, "texte du commentaire", 32767, 3)
+  if not author or author == "" then error("xlsx: author doit être non vide", 2) end
+  if not text or text == "" then error("xlsx: text doit être non vide", 2) end
+  local rr = self.comments[row]; if not rr then rr = {}; self.comments[row] = rr end
+  rr[col] = { author=author, text=text }
+  ensure_cell_extent(self, row, col)
+  return self
+end
+
+function Sheet:remove_comment(row, col)
+  check_index(row, "row", 3); check_index(col, "col", 3)
+  local rr = self.comments[row]; if rr then rr[col] = nil end
+  return self
+end
+
+function Sheet:set_row_hidden(row, hidden)
+  check_index(row, "row", 3)
+  if type(hidden) ~= "boolean" then error("xlsx: hidden doit être un booléen", 2) end
+  self.row_hidden[row] = hidden or nil
+  if hidden then ensure_cell_extent(self, row, 0) end
+  return self
+end
+
+function Sheet:set_column_hidden(col, hidden)
+  check_index(col, "col", 3)
+  if type(hidden) ~= "boolean" then error("xlsx: hidden doit être un booléen", 2) end
+  self.column_hidden[col] = hidden or nil
+  return self
+end
+
+function Sheet:set_tab_color(color)
+  self._tab_color = normalize_color(color, "couleur d'onglet", 3)
+  return self
+end
+
+function Sheet:set_visibility(state)
+  if state ~= "visible" and state ~= "hidden" and state ~= "very_hidden" then
+    error("xlsx: visibilité doit valoir visible, hidden ou very_hidden", 2)
+  end
+  self._visibility = state
+  return self
+end
+
 --- Ajoute une ligne complète à la suite. Un style facultatif s'applique aux valeurs présentes.
 function Sheet:append_row(values, style)
   if type(values) ~= "table" then error("xlsx: append_row attend une table", 2) end
@@ -1048,12 +1396,63 @@ local function worksheet_relationships_xml(rels)
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
   }
   for _, rel in ipairs(rels) do
-    b[#b + 1] = '<Relationship Id="' .. rel.id ..
-      '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="' ..
-      esc_xml(rel.target, "cible d'hyperlien", 0) .. '" TargetMode="External"/>'
+    local attrs = {
+      'Id="' .. rel.id .. '"',
+      'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/' .. rel.kind .. '"',
+      'Target="' .. esc_xml(rel.target, "cible de relation", 0) .. '"',
+    }
+    if rel.external then attrs[#attrs + 1] = 'TargetMode="External"' end
+    b[#b + 1] = '<Relationship ' .. table.concat(attrs, " ") .. '/>'
   end
   b[#b + 1] = '</Relationships>'
   return table.concat(b)
+end
+
+local function validation_formula_xml(value, date1904)
+  if value == nil then return nil end
+  if getmetatable(value) == DATE_MT then
+    return num2str(ymd_to_serial(value.y, value.m, value.d, value.h, value.mi, value.s, date1904))
+  end
+  if type(value) == "number" then return num2str(value) end
+  return value
+end
+
+local function comments_xml(sheet)
+  local entries, author_ids, authors = {}, {}, {}
+  for row, rr in pairs(sheet.comments) do
+    for col, comment in pairs(rr) do entries[#entries + 1] = { row=row, col=col, data=comment } end
+  end
+  if #entries == 0 then return nil, nil end
+  table.sort(entries, function(a, b) return a.row ~= b.row and a.row < b.row or a.col < b.col end)
+  for _, entry in ipairs(entries) do
+    local author = entry.data.author
+    if author_ids[author] == nil then author_ids[author] = #authors; authors[#authors + 1] = author end
+  end
+  local b = { '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors>' }
+  for _, author in ipairs(authors) do b[#b + 1] = '<author>' .. esc_xml(author, "auteur", 0) .. '</author>' end
+  b[#b + 1] = '</authors><commentList>'
+  for i, entry in ipairs(entries) do
+    local ref = col_ref(entry.col) .. (entry.row + 1)
+    b[#b + 1] = '<comment ref="' .. ref .. '" authorId="' .. author_ids[entry.data.author] ..
+      '" shapeId="' .. (i - 1) .. '"><text><t xml:space="preserve">' ..
+      esc_xml(entry.data.text, "commentaire", 0) .. '</t></text></comment>'
+  end
+  b[#b + 1] = '</commentList></comments>'
+
+  local v = { '<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">',
+    '<o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1"/></o:shapelayout>',
+    '<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>' }
+  for i, entry in ipairs(entries) do
+    v[#v + 1] = '<v:shape type="#_x0000_t202" style="position:absolute;margin-left:59.25pt;margin-top:1.5pt;width:144px;height:79px;z-index:' ..
+      i .. ';visibility:hidden" fillcolor="#ffffe1" o:insetmode="auto" id="_x0000_s' .. (1025 + i) .. '">' ..
+      '<v:fill color2="#ffffe1"/><v:shadow color="black" obscured="t"/><v:path o:connecttype="none"/>' ..
+      '<v:textbox style="mso-direction-alt:auto"><div style="text-align:left"/></v:textbox>' ..
+      '<x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/><x:AutoFill>False</x:AutoFill><x:Row>' ..
+      entry.row .. '</x:Row><x:Column>' .. entry.col .. '</x:Column></x:ClientData></v:shape>'
+  end
+  v[#v + 1] = '</xml>'
+  return table.concat(b), table.concat(v)
 end
 
 -- sérialise la feuille en XML ; alimente sst et renvoie aussi ses relations.
@@ -1061,31 +1460,39 @@ function Sheet:_xml(sst, sst_index)
   local b = {}
   b[#b + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
   b[#b + 1] = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+  if self._tab_color then b[#b + 1] = '<sheetPr><tabColor rgb="' .. self._tab_color .. '"/></sheetPr>' end
   if self.maxrow >= 0 and self.maxcol >= 0 then
     b[#b + 1] = '<dimension ref="A1:' .. col_ref(self.maxcol) .. (self.maxrow + 1) .. '"/>'
   end
   local pane = freeze_pane_xml(self._freeze_rows, self._freeze_cols)
   if pane then b[#b + 1] = pane end
-  if next(self.column_widths) then
+  if next(self.column_widths) or next(self.column_hidden) then
     b[#b + 1] = '<cols>'
-    local cols = {}
-    for col in pairs(self.column_widths) do cols[#cols + 1] = col end
+    local cols, seen_cols = {}, {}
+    for col in pairs(self.column_widths) do cols[#cols + 1] = col; seen_cols[col] = true end
+    for col in pairs(self.column_hidden) do if not seen_cols[col] then cols[#cols + 1] = col end end
     table.sort(cols)
     for _, col in ipairs(cols) do
-      b[#b + 1] = '<col min="' .. (col + 1) .. '" max="' .. (col + 1) ..
-        '" width="' .. num2str(self.column_widths[col]) .. '" customWidth="1"/>'
+      local attrs = { 'min="' .. (col + 1) .. '"', 'max="' .. (col + 1) .. '"' }
+      if self.column_widths[col] then
+        attrs[#attrs + 1] = 'width="' .. num2str(self.column_widths[col]) .. '"'
+        attrs[#attrs + 1] = 'customWidth="1"'
+      end
+      if self.column_hidden[col] then attrs[#attrs + 1] = 'hidden="1"' end
+      b[#b + 1] = '<col ' .. table.concat(attrs, " ") .. '/>'
     end
     b[#b + 1] = '</cols>'
   end
   b[#b + 1] = '<sheetData>'
   for r = 0, self.maxrow do
     local rowcells, rowstyles = self.cells[r], self.styles[r]
-    if rowcells or rowstyles or self.row_heights[r] then
+    if rowcells or rowstyles or self.row_heights[r] or self.row_hidden[r] then
       local rowattrs = { 'r="' .. (r + 1) .. '"' }
       if self.row_heights[r] then
         rowattrs[#rowattrs + 1] = 'ht="' .. num2str(self.row_heights[r]) .. '"'
         rowattrs[#rowattrs + 1] = 'customHeight="1"'
       end
+      if self.row_hidden[r] then rowattrs[#rowattrs + 1] = 'hidden="1"' end
       b[#b + 1] = '<row ' .. table.concat(rowattrs, " ") .. '>'
       for c = 0, self.maxcol do
         local v, style
@@ -1144,6 +1551,42 @@ function Sheet:_xml(sst, sst_index)
     for _, range in ipairs(self.merged_ranges) do b[#b + 1] = '<mergeCell ref="' .. range.ref .. '"/>' end
     b[#b + 1] = '</mergeCells>'
   end
+  for priority, rule in ipairs(self.conditional_formats) do
+    local dxf_id = self._workbook:_dxf_id(rule.style)
+    local xml_type = CF_TYPE_TO_XML[rule.type]
+    local attrs = { 'type="' .. xml_type .. '"', 'priority="' .. priority .. '"', 'dxfId="' .. dxf_id .. '"' }
+    if rule.stop_if_true then attrs[#attrs + 1] = 'stopIfTrue="1"' end
+    if rule.operator then attrs[#attrs + 1] = 'operator="' .. CF_OPERATORS[rule.operator] .. '"' end
+    if rule.text then attrs[#attrs + 1] = 'text="' .. esc_xml(rule.text, "texte conditionnel", 0) .. '"' end
+    b[#b + 1] = '<conditionalFormatting sqref="' .. rule.ref .. '"><cfRule ' .. table.concat(attrs, " ") .. '>'
+    local f1 = validation_formula_xml(rule.formula1, self._workbook._date1904)
+    local f2 = validation_formula_xml(rule.formula2, self._workbook._date1904)
+    if f1 then b[#b + 1] = '<formula>' .. esc_xml(f1, "formule conditionnelle", 0) .. '</formula>' end
+    if f2 then b[#b + 1] = '<formula>' .. esc_xml(f2, "formule conditionnelle", 0) .. '</formula>' end
+    b[#b + 1] = '</cfRule></conditionalFormatting>'
+  end
+  if #self.data_validations > 0 then
+    b[#b + 1] = '<dataValidations count="' .. #self.data_validations .. '">'
+    for _, validation in ipairs(self.data_validations) do
+      local attrs = { 'sqref="' .. validation.ref .. '"', 'type="' .. DATA_VALIDATION_TYPES[validation.type] .. '"' }
+      if validation.operator then attrs[#attrs + 1] = 'operator="' .. VALIDATION_OPERATORS[validation.operator] .. '"' end
+      attrs[#attrs + 1] = 'allowBlank="' .. (validation.allow_blank and '1' or '0') .. '"'
+      attrs[#attrs + 1] = 'showInputMessage="' .. (validation.show_input_message and '1' or '0') .. '"'
+      attrs[#attrs + 1] = 'showErrorMessage="' .. (validation.show_error_message and '1' or '0') .. '"'
+      attrs[#attrs + 1] = 'showDropDown="' .. (validation.show_dropdown and '0' or '1') .. '"'
+      for _, key in ipairs({ "prompt_title", "prompt", "error_title", "error", "error_style" }) do
+        local attr = ({prompt_title="promptTitle", error_title="errorTitle", error_style="errorStyle"})[key] or key
+        if validation[key] then attrs[#attrs + 1] = attr .. '="' .. esc_xml(validation[key], attr, 0) .. '"' end
+      end
+      b[#b + 1] = '<dataValidation ' .. table.concat(attrs, " ") .. '>'
+      local f1 = validation_formula_xml(validation.formula1, self._workbook._date1904)
+      local f2 = validation_formula_xml(validation.formula2, self._workbook._date1904)
+      if f1 then b[#b + 1] = '<formula1>' .. esc_xml(f1, "formule de validation", 0) .. '</formula1>' end
+      if f2 then b[#b + 1] = '<formula2>' .. esc_xml(f2, "formule de validation", 0) .. '</formula2>' end
+      b[#b + 1] = '</dataValidation>'
+    end
+    b[#b + 1] = '</dataValidations>'
+  end
 
   local rels, links = {}, {}
   local rows = {}
@@ -1161,15 +1604,23 @@ function Sheet:_xml(sst, sst_index)
         attrs[#attrs + 1] = 'location="' .. esc_xml(link.target, "cible interne", 0) .. '"'
       else
         local id = "rId" .. (#rels + 1)
-        rels[#rels + 1] = { id=id, target=link.target }
+        rels[#rels + 1] = { id=id, target=link.target, kind="hyperlink", external=true }
         attrs[#attrs + 1] = 'r:id="' .. id .. '"'
       end
       links[#links + 1] = '<hyperlink ' .. table.concat(attrs, " ") .. '/>'
     end
   end
   if #links > 0 then b[#b + 1] = '<hyperlinks>' .. table.concat(links) .. '</hyperlinks>' end
+  local comments, vml = comments_xml(self)
+  if comments then
+    local comments_id = "rId" .. (#rels + 1)
+    rels[#rels + 1] = { id=comments_id, target="../comments/comment" .. self._sheet_index .. ".xml", kind="comments" }
+    local vml_id = "rId" .. (#rels + 1)
+    rels[#rels + 1] = { id=vml_id, target="../drawings/commentsDrawing" .. self._sheet_index .. ".vml", kind="vmlDrawing" }
+    b[#b + 1] = '<legacyDrawing r:id="' .. vml_id .. '"/>'
+  end
   b[#b + 1] = '</worksheet>'
-  return table.concat(b), worksheet_relationships_xml(rels)
+  return table.concat(b), worksheet_relationships_xml(rels), comments, vml
 end
 
 -- ----------------------------------------------------------------------------
@@ -1184,6 +1635,23 @@ function Workbook:_style_id(style, value)
   return register_style(self._style_registry, effective_style_data(style, value))
 end
 
+function Workbook:_dxf_id(style)
+  local data = require_style(style, 3)
+  if not self._style_registry then error("xlsx: registre de styles indisponible", 2) end
+  return register_dxf(self._style_registry, data)
+end
+
+local function validate_defined_name(name, level)
+  if type(name) ~= "string" or name == "" then error("xlsx: le nom défini doit être une string non vide", level or 3) end
+  validate_xml_text(name, "nom défini", level or 3)
+  if #name > 255 then error("xlsx: le nom défini dépasse 255 octets", level or 3) end
+  if not name:match("^[A-Za-z_\\][A-Za-z0-9_.\\]*$") then error("xlsx: nom défini invalide", level or 3) end
+  if name:match("^[Rr][Cc]$") or name:match("^[Rr]%d+$") or name:match("^[Cc]%d+$") or name:match("^[A-Za-z]+%d+$") then
+    error("xlsx: le nom défini ressemble à une référence de cellule", level or 3)
+  end
+  return name
+end
+
 function xlsx.new(opts)
   opts = opts or {}
   if type(opts) ~= "table" then error("xlsx: new attend une table d'options", 2) end
@@ -1196,7 +1664,7 @@ function xlsx.new(opts)
   end
   return setmetatable({
     sheets = {}, _date1904 = date_system == "1904", _sheet_names = {},
-    _style_registry = nil,
+    _style_registry = nil, _active_sheet = 1, _defined_names = {}, _defined_name_map = {},
   }, Workbook)
 end
 
@@ -1214,19 +1682,90 @@ function Workbook:add_sheet(name)
   local key = name:lower()
   if self._sheet_names[key] then error("xlsx: nom de feuille dupliqué : " .. name, 2) end
   local sh = new_sheet(name, self)
+  sh._sheet_index = #self.sheets + 1
   self.sheets[#self.sheets + 1] = sh
   self._sheet_names[key] = true
   return sh
 end
 
+function Workbook:set_active_sheet(which)
+  local index
+  if math.type(which) == "integer" then index = which
+  elseif type(which) == "string" then
+    for i, sheet in ipairs(self.sheets) do if sheet.name == which then index = i; break end end
+  else error("xlsx: set_active_sheet attend un nom ou un index 1-based", 2) end
+  if not index or not self.sheets[index] then error("xlsx: feuille active introuvable", 2) end
+  if self.sheets[index]._visibility ~= "visible" then error("xlsx: la feuille active doit être visible", 2) end
+  self._active_sheet = index
+  return self
+end
+
+function Workbook:get_active_sheet()
+  return self.sheets[self._active_sheet]
+end
+
+local function resolve_local_sheet(workbook, value, level)
+  if value == nil then return nil end
+  if math.type(value) == "integer" then
+    if value < 1 or not workbook.sheets[value] then error("xlsx: local_sheet invalide", level or 3) end
+    return value
+  end
+  if type(value) == "string" then
+    for i, sheet in ipairs(workbook.sheets) do if sheet.name == value then return i end end
+    error("xlsx: local_sheet introuvable", level or 3)
+  end
+  error("xlsx: local_sheet doit être un nom ou un index 1-based", level or 3)
+end
+
+function Workbook:define_name(name, reference, opts)
+  name = validate_defined_name(name, 3)
+  if type(reference) ~= "string" or reference == "" then error("xlsx: reference doit être une string non vide", 2) end
+  validate_xml_text(reference, "référence de nom défini", 3)
+  if #reference > 8192 then error("xlsx: référence de nom défini trop longue", 2) end
+  opts = opts or {}; if type(opts) ~= "table" then error("xlsx: opts doit être une table", 2) end
+  for k in pairs(opts) do if k ~= "local_sheet" and k ~= "hidden" and k ~= "comment" then error("xlsx: option de nom défini inconnue : " .. tostring(k), 2) end end
+  if opts.hidden ~= nil and type(opts.hidden) ~= "boolean" then error("xlsx: hidden doit être un booléen", 2) end
+  local local_sheet = resolve_local_sheet(self, opts.local_sheet, 3)
+  local comment = validate_optional_text(opts.comment, "commentaire du nom défini", 255, 3)
+  local key = name:lower() .. "@" .. tostring(local_sheet or 0)
+  if self._defined_name_map[key] then error("xlsx: nom défini dupliqué : " .. name, 2) end
+  local item = { name=name, reference=reference, local_sheet=local_sheet, hidden=opts.hidden == true, comment=comment }
+  self._defined_names[#self._defined_names + 1] = item; self._defined_name_map[key] = item
+  return self
+end
+
+function Workbook:remove_defined_name(name, opts)
+  name = validate_defined_name(name, 3); opts = opts or {}
+  local local_sheet = resolve_local_sheet(self, opts.local_sheet, 3)
+  local key = name:lower() .. "@" .. tostring(local_sheet or 0)
+  local item = self._defined_name_map[key]
+  if not item then return self end
+  for i, value in ipairs(self._defined_names) do if value == item then table.remove(self._defined_names, i); break end end
+  self._defined_name_map[key] = nil
+  return self
+end
+
+function Workbook:get_defined_names()
+  local out = {}
+  for i, item in ipairs(self._defined_names) do out[i] = shallow_copy(item) end
+  return out
+end
+
 -- construit la liste des parties ZIP {name=, data=}
 function Workbook:_parts()
   local nsheets = #self.sheets
+  if nsheets == 0 then error("xlsx: le classeur doit contenir au moins une feuille", 2) end
+  local visible = 0
+  for _, sheet in ipairs(self.sheets) do if sheet._visibility == "visible" then visible = visible + 1 end end
+  if visible == 0 then error("xlsx: au moins une feuille doit rester visible", 2) end
+  if not self.sheets[self._active_sheet] or self.sheets[self._active_sheet]._visibility ~= "visible" then
+    error("xlsx: la feuille active doit être visible", 2)
+  end
   self._style_registry = new_style_registry()
   local sst, sst_index = {}, {}
-  local sheet_xmls, sheet_rels = {}, {}
+  local sheet_xmls, sheet_rels, sheet_comments, sheet_vml = {}, {}, {}, {}
   for i = 1, nsheets do
-    sheet_xmls[i], sheet_rels[i] = self.sheets[i]:_xml(sst, sst_index)
+    sheet_xmls[i], sheet_rels[i], sheet_comments[i], sheet_vml[i] = self.sheets[i]:_xml(sst, sst_index)
   end
 
   local parts = {}
@@ -1238,6 +1777,9 @@ function Workbook:_parts()
     t[#t + 1] = '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
     t[#t + 1] = '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
     t[#t + 1] = '<Default Extension="xml" ContentType="application/xml"/>'
+    local has_comments = false
+    for i = 1, nsheets do if sheet_comments[i] then has_comments = true; break end end
+    if has_comments then t[#t + 1] = '<Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/>' end
     t[#t + 1] = '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
     for i = 1, nsheets do
       t[#t + 1] = '<Override PartName="/xl/worksheets/sheet' .. i ..
@@ -1245,6 +1787,9 @@ function Workbook:_parts()
     end
     t[#t + 1] = '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
     t[#t + 1] = '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+    for i = 1, nsheets do if sheet_comments[i] then
+      t[#t + 1] = '<Override PartName="/xl/comments/comment' .. i .. '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>'
+    end end
     t[#t + 1] = '</Types>'
     add("[Content_Types].xml", table.concat(t))
   end
@@ -1261,12 +1806,26 @@ function Workbook:_parts()
     t[#t + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     t[#t + 1] = '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
     if self._date1904 then t[#t + 1] = '<workbookPr date1904="1"/>' end
+    t[#t + 1] = '<bookViews><workbookView activeTab="' .. (self._active_sheet - 1) .. '"/></bookViews>'
     t[#t + 1] = '<sheets>'
     for i = 1, nsheets do
+      local state = self.sheets[i]._visibility ~= "visible" and (' state="' .. (self.sheets[i]._visibility == "very_hidden" and "veryHidden" or "hidden") .. '"') or ""
       t[#t + 1] = '<sheet name="' .. esc_xml(self.sheets[i].name, "nom de feuille", 0) ..
-        '" sheetId="' .. i .. '" r:id="rId' .. i .. '"/>'
+        '" sheetId="' .. i .. '"' .. state .. ' r:id="rId' .. i .. '"/>'
     end
-    t[#t + 1] = '</sheets></workbook>'
+    t[#t + 1] = '</sheets>'
+    if #self._defined_names > 0 then
+      t[#t + 1] = '<definedNames>'
+      for _, item in ipairs(self._defined_names) do
+        local attrs = { 'name="' .. esc_xml(item.name, "nom défini", 0) .. '"' }
+        if item.local_sheet then attrs[#attrs + 1] = 'localSheetId="' .. (item.local_sheet - 1) .. '"' end
+        if item.hidden then attrs[#attrs + 1] = 'hidden="1"' end
+        if item.comment then attrs[#attrs + 1] = 'comment="' .. esc_xml(item.comment, "commentaire", 0) .. '"' end
+        t[#t + 1] = '<definedName ' .. table.concat(attrs, " ") .. '>' .. esc_xml(item.reference, "référence", 0) .. '</definedName>'
+      end
+      t[#t + 1] = '</definedNames>'
+    end
+    t[#t + 1] = '</workbook>'
     add("xl/workbook.xml", table.concat(t))
   end
 
@@ -1289,6 +1848,8 @@ function Workbook:_parts()
   for i = 1, nsheets do
     add("xl/worksheets/sheet" .. i .. ".xml", sheet_xmls[i])
     if sheet_rels[i] then add("xl/worksheets/_rels/sheet" .. i .. ".xml.rels", sheet_rels[i]) end
+    if sheet_comments[i] then add("xl/comments/comment" .. i .. ".xml", sheet_comments[i]) end
+    if sheet_vml[i] then add("xl/drawings/commentsDrawing" .. i .. ".vml", sheet_vml[i]) end
   end
 
   do
@@ -1441,8 +2002,9 @@ end
 -- LECTURE
 -- ============================================================================
 -- Lecture : valeurs, dates, formules, styles, dimensions, fusions, volets,
--- filtres et hyperliens. read() conserve son contrat historique et renvoie la
--- valeur mise en cache ; get_formula() expose séparément l'expression.
+-- filtres, hyperliens, validations, règles conditionnelles, commentaires,
+-- propriétés de feuilles et noms définis. read() conserve son contrat historique
+-- et renvoie la valeur mise en cache ; get_formula() expose l'expression.
 
 -- ----------------------------------------------------------------------------
 -- INFLATE (RFC 1951) — décompression DEFLATE brute, en Lua pur
@@ -1885,9 +2447,35 @@ local function parse_border_side(body, side)
   return { style=style, color=color and normalize_color(color, "couleur de bordure", 0) or nil }
 end
 
+local function parse_dxf_style(body)
+  local fontbody = body:match("<font>(.-)</font>") or ""
+  local fillbody = body:match("<fill>(.-)</fill>") or ""
+  local borderbody = body:match("<border>(.-)</border>") or ""
+  local color = fontbody:match('<color[^>]-rgb="([%x]+)"')
+  local fill = fillbody:match('<fgColor[^>]-rgb="([%x]+)"')
+  local underline = fontbody:match('<u[^>]-val="([^\"]+)"') or (fontbody:find("<u%s*/>") and "single" or nil)
+  local border = {}
+  for _, side in ipairs({ "left", "right", "top", "bottom" }) do border[side] = parse_border_side(borderbody, side) end
+  local align = body:match("<alignment%s*(.-)/>") or body:match("<alignment%s*(.-)>")
+  local fmt = body:match('<numFmt[^>]-formatCode="([^\"]*)"')
+  local data = {
+    bold=fontbody:find("<b[%s/>]", 1) ~= nil, italic=fontbody:find("<i[%s/>]", 1) ~= nil,
+    underline=underline, strike=fontbody:find("<strike[%s/>]", 1) ~= nil,
+    font_name=unescape(fontbody:match('<name[^>]-val="([^\"]*)"') or ""),
+    font_size=tonumber(fontbody:match('<sz[^>]-val="([^\"]*)"')),
+    font_color=color and normalize_color(color, "couleur dxf", 0) or nil,
+    fill_color=fill and normalize_color(fill, "fond dxf", 0) or nil,
+    horizontal=xml_attr(align, "horizontal"), vertical=xml_attr(align, "vertical"),
+    wrap_text=xml_attr(align, "wrapText") == "1" or xml_attr(align, "wrapText") == "true",
+    number_format=fmt and unescape(fmt) or nil, border=next(border) and border or nil,
+  }
+  if data.font_name == "" then data.font_name = nil end
+  return style_object_from_data(data)
+end
+
 local function parse_styles(xml)
-  local datestyle, style_objects = {}, { [0] = false }
-  if not xml then return datestyle, style_objects end
+  local datestyle, style_objects, dxf_objects = {}, { [0] = false }, {}
+  if not xml then return datestyle, style_objects, dxf_objects end
   local fmtcode = {}
   for tag in xml:gmatch("<numFmt%s.-/>") do
     local id = tonumber(tag:match('numFmtId="(%d+)"'))
@@ -1966,7 +2554,9 @@ local function parse_styles(xml)
       not data.horizontal and not data.vertical and not data.wrap_text and not data.number_format and not data.border)
     style_objects[style_index] = is_default and false or style_object_from_data(data)
   end
-  return datestyle, style_objects
+  local dxfs = xml:match("<dxfs[^>]*>(.-)</dxfs>") or ""
+  for i, element in ipairs(parse_repeated_elements(dxfs, "dxf")) do dxf_objects[i - 1] = parse_dxf_style(element.body) end
+  return datestyle, style_objects, dxf_objects
 end
 
 local function parse_relationships(xml)
@@ -1985,16 +2575,43 @@ local function parse_relationships(xml)
   return result
 end
 
-local function parse_sheet(xml, shared, datestyle, style_objects, date1904, relationships)
+local function parse_comments(xml)
+  local map, list = {}, {}
+  if not xml then return map, list end
+  local authors = {}
+  local authors_body = xml:match("<authors>(.-)</authors>") or ""
+  for text in authors_body:gmatch("<author>(.-)</author>") do authors[#authors + 1] = unescape(text) end
+  local comment_body = xml:match("<commentList>(.-)</commentList>") or ""
+  for attrs, inner in comment_body:gmatch("<comment%s+(.-)>(.-)</comment>") do
+    local ref = xml_attr(attrs, "ref")
+    local r, c
+    if ref then r, c = ref_to_rowcol(ref) end
+    if r then
+      local author = authors[(tonumber(xml_attr(attrs, "authorId")) or 0) + 1] or ""
+      local text_body = inner:match("<text>(.-)</text>") or inner
+      local pieces = {}; for text in text_body:gmatch("<t[^>]*>(.-)</t>") do pieces[#pieces + 1] = unescape(text) end
+      local item = { row=r, col=c, ref=ref, author=author, text=table.concat(pieces) }
+      local rr = map[r]; if not rr then rr = {}; map[r] = rr end; rr[c] = item
+      list[#list + 1] = item
+    end
+  end
+  return map, list
+end
+
+local function parse_sheet(xml, shared, datestyle, style_objects, dxf_objects, date1904, relationships, comment_xml)
   local cells, formulas, styles = {}, {}, {}
-  local row_heights, column_widths = {}, {}
+  local row_heights, column_widths, row_hidden, column_hidden = {}, {}, {}, {}
   local maxrow, maxcol = -1, -1
 
   for tag in xml:gmatch("<col%s.-/>") do
     local first, last = tonumber(tag:match('min="(%d+)"')), tonumber(tag:match('max="(%d+)"'))
     local width = tonumber(tag:match('width="([^"]+)"'))
-    if first and last and width and first >= 1 and last <= MAX_COL + 1 and first <= last then
-      for col = first - 1, last - 1 do column_widths[col] = width end
+    local hidden = tag:match('hidden="([^"]+)"')
+    if first and last and first >= 1 and last <= MAX_COL + 1 and first <= last then
+      for col = first - 1, last - 1 do
+        if width then column_widths[col] = width end
+        if hidden == "1" or hidden == "true" then column_hidden[col] = true end
+      end
     end
   end
 
@@ -2002,7 +2619,11 @@ local function parse_sheet(xml, shared, datestyle, style_objects, date1904, rela
     local rowtag = crow:match("^(<row[^>]*>)") or ""
     local rownum = tonumber(rowtag:match('r="(%d+)"'))
     local height = tonumber(rowtag:match('ht="([^"]+)"'))
-    if rownum and height and rownum >= 1 and rownum <= MAX_ROW + 1 then row_heights[rownum - 1] = height end
+    local hidden = rowtag:match('hidden="([^"]+)"')
+    if rownum and rownum >= 1 and rownum <= MAX_ROW + 1 then
+      if height then row_heights[rownum - 1] = height end
+      if hidden == "1" or hidden == "true" then row_hidden[rownum - 1] = true end
+    end
     local p = 1
     while true do
       local cs = crow:find("<c[%s/>]", p)
@@ -2092,8 +2713,55 @@ local function parse_sheet(xml, shared, datestyle, style_objects, date1904, rela
       end
     end
   end
+  local data_validations = {}
+  local dvs = xml:match("<dataValidations[^>]*>(.-)</dataValidations>") or ""
+  for attrs, inner in dvs:gmatch("<dataValidation%s+(.-)>(.-)</dataValidation>") do
+    local ref = xml_attr(attrs, "sqref")
+    if ref and not ref:find(" ", 1, true) then
+      local kind_xml = xml_attr(attrs, "type") or "none"
+      local kind = ({textLength="text_length"})[kind_xml] or kind_xml
+      local item = {
+        ref=ref, type=kind, operator=VALIDATION_OPERATOR_FROM_XML[xml_attr(attrs, "operator")],
+        allow_blank=xml_attr(attrs, "allowBlank") == "1" or xml_attr(attrs, "allowBlank") == "true",
+        show_input_message=xml_attr(attrs, "showInputMessage") == "1" or xml_attr(attrs, "showInputMessage") == "true",
+        show_error_message=xml_attr(attrs, "showErrorMessage") == "1" or xml_attr(attrs, "showErrorMessage") == "true",
+        show_dropdown=not (xml_attr(attrs, "showDropDown") == "1" or xml_attr(attrs, "showDropDown") == "true"),
+        prompt_title=(xml_attr(attrs, "promptTitle") and unescape(xml_attr(attrs, "promptTitle"))),
+        prompt=(xml_attr(attrs, "prompt") and unescape(xml_attr(attrs, "prompt"))),
+        error_title=(xml_attr(attrs, "errorTitle") and unescape(xml_attr(attrs, "errorTitle"))),
+        error=(xml_attr(attrs, "error") and unescape(xml_attr(attrs, "error"))), error_style=xml_attr(attrs, "errorStyle"),
+        formula1=unescape(inner:match("<formula1>(.-)</formula1>") or ""),
+        formula2=unescape(inner:match("<formula2>(.-)</formula2>") or ""),
+      }
+      if item.formula1 == "" then item.formula1 = nil end; if item.formula2 == "" then item.formula2 = nil end
+      if kind == "list" and item.formula1 and item.formula1:match('^".*"$') then
+        item.values = {}; for value in item.formula1:sub(2,-2):gmatch("[^,]+") do item.values[#item.values + 1] = value end
+      end
+      data_validations[#data_validations + 1] = item
+    end
+  end
+  local conditional_formats = {}
+  for cfattrs, cfbody in xml:gmatch("<conditionalFormatting%s+(.-)>(.-)</conditionalFormatting>") do
+    local ref = xml_attr(cfattrs, "sqref")
+    for attrs, inner in cfbody:gmatch("<cfRule%s+(.-)>(.-)</cfRule>") do
+      local xmltype = xml_attr(attrs, "type")
+      local kind = CF_TYPE_FROM_XML[xmltype] or xmltype
+      local formulas = {}; for formula in inner:gmatch("<formula>(.-)</formula>") do formulas[#formulas + 1] = unescape(formula) end
+      conditional_formats[#conditional_formats + 1] = {
+        ref=ref, type=kind, operator=VALIDATION_OPERATOR_FROM_XML[xml_attr(attrs, "operator")],
+        text=(xml_attr(attrs, "text") and unescape(xml_attr(attrs, "text"))), stop_if_true=xml_attr(attrs, "stopIfTrue") == "1" or xml_attr(attrs, "stopIfTrue") == "true",
+        priority=tonumber(xml_attr(attrs, "priority")), style=dxf_objects[tonumber(xml_attr(attrs, "dxfId") or "-1")],
+        formula1=formulas[1], formula2=formulas[2],
+      }
+    end
+  end
+  table.sort(conditional_formats, function(a,b) return (a.priority or 0) < (b.priority or 0) end)
+  local tab_color = xml:match('<tabColor[^>]-rgb="([%x]+)"')
+  if tab_color then tab_color = normalize_color(tab_color, "couleur d'onglet", 0) end
+  local comment_map, comment_list = parse_comments(comment_xml)
   return cells, formulas, styles, maxrow, maxcol, row_heights, column_widths,
-    freeze_rows, freeze_cols, auto_filter, merged, hyperlink_ranges
+    freeze_rows, freeze_cols, auto_filter, merged, hyperlink_ranges,
+    row_hidden, column_hidden, data_validations, conditional_formats, tab_color, comment_map, comment_list
 end
 
 local function package_path(base, target)
@@ -2129,7 +2797,9 @@ local function parse_workbook(wbxml, relsxml)
     if seen[name_key] then error("xlsx: nom de feuille dupliqué dans le classeur : " .. name, 0) end
     seen[name_key] = true
     local rid = tag:match('r:id="([^"]*)"')
-    sheets[#sheets + 1] = { name = name, rid = rid }
+    local state = tag:match('state="([^"]+)"') or "visible"
+    if state == "veryHidden" then state = "very_hidden" end
+    sheets[#sheets + 1] = { name = name, rid = rid, visibility = state }
   end
   for _, sh in ipairs(sheets) do
     local target = rid2target[sh.rid]
@@ -2141,7 +2811,21 @@ local function parse_workbook(wbxml, relsxml)
   local workbook_pr = wbxml:match("<workbookPr%s.-/>") or wbxml:match("<workbookPr%s.-</workbookPr>") or ""
   local date1904 = workbook_pr:match('date1904="([^"]+)"')
   date1904 = date1904 == "1" or date1904 == "true"
-  return sheets, date1904
+  local view = wbxml:match("<workbookView%s.-/>") or ""
+  local active_sheet = (tonumber(view:match('activeTab="(%d+)"')) or 0) + 1
+  if not sheets[active_sheet] then active_sheet = 1 end
+  local defined_names = {}
+  local body = wbxml:match("<definedNames>(.-)</definedNames>") or ""
+  for attrs, reference in body:gmatch("<definedName%s+(.-)>(.-)</definedName>") do
+    local name = xml_attr(attrs, "name")
+    if name then defined_names[#defined_names + 1] = {
+      name=unescape(name), reference=unescape(reference),
+      local_sheet=(tonumber(xml_attr(attrs, "localSheetId")) and tonumber(xml_attr(attrs, "localSheetId")) + 1 or nil),
+      hidden=xml_attr(attrs, "hidden") == "1" or xml_attr(attrs, "hidden") == "true",
+      comment=(xml_attr(attrs, "comment") and unescape(xml_attr(attrs, "comment"))),
+    } end
+  end
+  return sheets, date1904, active_sheet, defined_names
 end
 
 -- ----------------------------------------------------------------------------
@@ -2181,6 +2865,35 @@ end
 function ReadSheet:get_row_height(row)
   check_index(row, "row", 3)
   return self.row_heights[row]
+end
+
+function ReadSheet:is_row_hidden(row)
+  check_index(row, "row", 3); return self.row_hidden[row] == true
+end
+
+function ReadSheet:is_column_hidden(col)
+  check_index(col, "col", 3); return self.column_hidden[col] == true
+end
+
+function ReadSheet:get_tab_color() return self.tab_color end
+function ReadSheet:get_visibility() return self.visibility end
+
+function ReadSheet:get_data_validations()
+  local out = {}; for i, value in ipairs(self.data_validations) do out[i] = copy_validation(value) end; return out
+end
+
+function ReadSheet:get_conditional_formats()
+  local out = {}; for i, value in ipairs(self.conditional_formats) do out[i] = copy_conditional_format(value) end; return out
+end
+
+function ReadSheet:get_comment(row, col)
+  check_index(row, "row", 3); check_index(col, "col", 3)
+  local rr = self.comment_map[row]; local value = rr and rr[col]
+  return value and { author=value.author, text=value.text, ref=value.ref } or nil
+end
+
+function ReadSheet:get_comments()
+  local out = {}; for i, value in ipairs(self.comment_list) do out[i] = { row=value.row, col=value.col, ref=value.ref, author=value.author, text=value.text } end; return out
 end
 
 function ReadSheet:get_frozen_panes()
@@ -2246,6 +2959,30 @@ function ReadWB:sheet_names()
   return t
 end
 
+function ReadWB:get_active_sheet()
+  return self._sheets[self._active_sheet] and self._sheets[self._active_sheet].name or nil
+end
+
+function ReadWB:get_defined_names()
+  local out = {}; for i, item in ipairs(self._defined_names) do out[i] = shallow_copy(item) end; return out
+end
+
+function ReadWB:get_defined_name(name, local_sheet)
+  if type(name) ~= "string" then error("xlsx: get_defined_name attend un nom", 2) end
+  if type(local_sheet) == "string" then
+    local resolved
+    for i, sheet in ipairs(self._sheets) do if sheet.name == local_sheet then resolved = i; break end end
+    if not resolved then return nil end
+    local_sheet = resolved
+  elseif local_sheet ~= nil and math.type(local_sheet) ~= "integer" then
+    error("xlsx: local_sheet doit être un nom ou un index 1-based", 2)
+  end
+  for _, item in ipairs(self._defined_names) do
+    if item.name:lower() == name:lower() and item.local_sheet == local_sheet then return shallow_copy(item) end
+  end
+  return nil
+end
+
 local function rels_path_for_part(part)
   local dir, file = part:match("^(.-)([^/]+)$")
   if not dir then return "_rels/" .. part .. ".rels" end
@@ -2272,7 +3009,15 @@ function ReadWB:sheet(which)
     local rel_entry = self._byname[rels_path_for_part(def.path)]
     local rel_xml = rel_entry and validate_xml_document(zip_extract(self._data, rel_entry, self._limits), rel_entry.name) or nil
     local relationships = parse_relationships(rel_xml)
-    return { parse_sheet(xml, self._shared, self._datestyle, self._style_objects, self._date1904, relationships) }
+    local comment_xml
+    for _, rel in pairs(relationships) do
+      if rel.rel_type and rel.rel_type:match("/comments$") then
+        local path = package_path("xl/worksheets/", rel.target)
+        local ce = path and self._byname[path]
+        if ce then comment_xml = validate_xml_document(zip_extract(self._data, ce, self._limits), path) end
+      end
+    end
+    return { parse_sheet(xml, self._shared, self._datestyle, self._style_objects, self._dxf_objects, self._date1904, relationships, comment_xml) }
   end)
   if not ok then return nil, tostring(result) end
   local values = result
@@ -2281,6 +3026,9 @@ function ReadWB:sheet(which)
     maxrow=values[4], maxcol=values[5], row_heights=values[6], column_widths=values[7],
     freeze_rows=values[8], freeze_cols=values[9], auto_filter=values[10],
     merged_ranges=values[11], hyperlink_ranges=values[12],
+    row_hidden=values[13], column_hidden=values[14], data_validations=values[15],
+    conditional_formats=values[16], tab_color=values[17], comment_map=values[18], comment_list=values[19],
+    visibility=def.visibility or "visible",
   }, ReadSheet)
   self._cache[def] = rs
   return rs
@@ -2398,12 +3146,12 @@ function xlsx.open(path, opts)
     local relsxml = part("xl/_rels/workbook.xml.rels") or ""
     local ssxml = part("xl/sharedStrings.xml")
     local shared = ssxml and parse_shared_strings(ssxml) or {}
-    local sheets, date1904 = parse_workbook(wbxml, relsxml)
-    local datestyle, style_objects = parse_styles(part("xl/styles.xml"))
+    local sheets, date1904, active_sheet, defined_names = parse_workbook(wbxml, relsxml)
+    local datestyle, style_objects, dxf_objects = parse_styles(part("xl/styles.xml"))
     return setmetatable({
       _data=data, _byname=byname, _shared=shared, _sheets=sheets,
-      _cache={}, _datestyle=datestyle, _style_objects=style_objects,
-      _date1904=date1904, _limits=limits,
+      _cache={}, _datestyle=datestyle, _style_objects=style_objects, _dxf_objects=dxf_objects,
+      _date1904=date1904, _limits=limits, _active_sheet=active_sheet, _defined_names=defined_names,
     }, ReadWB)
   end)
   if not ok then return nil, tostring(result) end

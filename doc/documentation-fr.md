@@ -3,7 +3,7 @@
 Référence des modules `xlsx` et `dataframe`. La cible principale est Babet avec
 Lua 5.5, mais le cœur reste compatible avec Lua standard 5.3+.
 
-Documentation de lua-xlsx 1.2.0.
+Documentation de lua-xlsx 1.3.0.
 
 ## Table des matières
 
@@ -164,14 +164,14 @@ sh:write_rows({
 
 ## Styles, structure, mise en page, hyperliens et formules
 
-La version 1.2.0 écrit ces informations et expose également leur sous-ensemble
+La version 1.3.0 écrit ces informations et expose également leur sous-ensemble
 pris en charge dans l'API de lecture. Les objets `style`, `formula` et
 `hyperlink` sont immuables.
 
 ### `xlsx.VERSION`
 
 ```lua
-assert(xlsx.VERSION == "1.2.0")
+assert(xlsx.VERSION == "1.3.0")
 ```
 
 ### `xlsx.style([opts]) -> style`
@@ -481,7 +481,260 @@ sh:write(10, 3, xlsx.formula("SUM(D2:D10)", 125.40), money)
 
 `xlsx.is_formula(value)` reconnaît les objets de formule.
 
-### Exemple combiné 1.2.0
+### Validations de données
+
+#### `sheet:add_data_validation(range, opts) -> sheet`
+
+La plage est une cellule ou une plage A1. Une validation est ajoutée sans
+modifier les valeurs présentes.
+
+Types pris en charge :
+
+| `type` | Usage |
+|---|---|
+| `list` | liste inline ou formule/plage nommée |
+| `whole` | nombres entiers |
+| `decimal` | nombres décimaux |
+| `date` | dates Excel |
+| `time` | heures Excel |
+| `text_length` | longueur du texte |
+| `custom` | formule personnalisée |
+
+Opérateurs pris en charge pour les types numériques, dates, heures et longueurs :
+`between`, `not_between`, `equal`, `not_equal`, `greater_than`, `less_than`,
+`greater_or_equal` et `less_or_equal`.
+
+Liste inline :
+
+```lua
+sh:add_data_validation("A2:A100", {
+  type = "list",
+  values = { "Oui", "Non", "En attente" },
+})
+```
+
+Les choix inline ne peuvent contenir ni virgule ni guillemet et la formule
+produite ne peut dépasser 255 octets. Pour une liste plus riche, utiliser une
+plage nommée :
+
+```lua
+wb:define_name("Statuts", "'Paramètres'!$A$1:$A$20")
+sh:add_data_validation("A2:A100", {
+  type = "list",
+  formula = "Statuts",
+})
+```
+
+Entier compris entre deux bornes :
+
+```lua
+sh:add_data_validation("B2:B100", {
+  type = "whole",
+  operator = "between",
+  minimum = 0,
+  maximum = 100,
+})
+```
+
+Date postérieure à une date donnée :
+
+```lua
+sh:add_data_validation("C2:C100", {
+  type = "date",
+  operator = "greater_than",
+  value = xlsx.date(2026, 1, 1),
+})
+```
+
+Formule personnalisée :
+
+```lua
+sh:add_data_validation("D2:D100", {
+  type = "custom",
+  formula = "MOD(D2,2)=0",
+})
+```
+
+Messages d'aide et d'erreur :
+
+```lua
+sh:add_data_validation("A2:A100", {
+  type = "list",
+  values = { "Oui", "Non" },
+  allow_blank = true,
+  show_dropdown = true,
+  show_input_message = true,
+  prompt_title = "Choix",
+  prompt = "Sélectionner une valeur.",
+  show_error_message = true,
+  error_style = "stop", -- stop, warning ou information
+  error_title = "Valeur incorrecte",
+  error = "Choisir Oui ou Non.",
+})
+```
+
+`remove_data_validation(range)` supprime toutes les validations exactement
+associées à cette plage. `get_data_validations()` renvoie des copies des règles
+déjà ajoutées.
+
+### Mise en forme conditionnelle
+
+#### `sheet:add_conditional_format(range, opts) -> sheet`
+
+Le champ `style` est obligatoire et doit provenir de `xlsx.style()`. Pour les
+règles conditionnelles, seuls la police, le fond et les quatre bordures sont
+pris en charge. Les formats numériques et alignements sont refusés afin de ne
+pas promettre une conservation partielle.
+
+Comparaison de cellule :
+
+```lua
+local negative = xlsx.style({
+  font_color = "9C0006",
+  fill_color = "FFC7CE",
+})
+
+sh:add_conditional_format("B2:B100", {
+  type = "cell",
+  operator = "less_than",
+  value = 0,
+  style = negative,
+})
+```
+
+Entre deux valeurs :
+
+```lua
+sh:add_conditional_format("B2:B100", {
+  type = "cell",
+  operator = "between",
+  minimum = 10,
+  maximum = 20,
+  style = xlsx.style({ fill_color = "FFF2CC" }),
+})
+```
+
+Texte contenant une chaîne :
+
+```lua
+sh:add_conditional_format("C2:C100", {
+  type = "contains_text",
+  text = "urgent",
+  style = xlsx.style({ bold = true, font_color = "C00000" }),
+})
+```
+
+Cellules vides, non vides et doublons :
+
+```lua
+sh:add_conditional_format("D2:D100", {
+  type = "blanks",
+  style = xlsx.style({ fill_color = "FFFF00" }),
+})
+
+sh:add_conditional_format("E2:E100", {
+  type = "not_blanks",
+  style = xlsx.style({ border = { bottom = { style = "thin" } } }),
+})
+
+sh:add_conditional_format("F2:F100", {
+  type = "duplicate",
+  style = xlsx.style({ fill_color = "FFC7CE" }),
+})
+```
+
+Formule personnalisée :
+
+```lua
+sh:add_conditional_format("A2:D100", {
+  type = "custom",
+  formula = "$D2>1000",
+  stop_if_true = true,
+  style = xlsx.style({ bold = true, fill_color = "C6EFCE" }),
+})
+```
+
+`remove_conditional_format(range)` supprime les règles exactement associées à
+la plage. `get_conditional_formats()` renvoie des copies des règles ajoutées.
+Les priorités suivent l'ordre d'ajout.
+
+### Commentaires de cellules
+
+```lua
+sh:set_comment(2, 0, {
+  author = "Julien",
+  text = "Valeur à vérifier avant publication.",
+})
+```
+
+`author` et `text` sont obligatoires, non vides, UTF-8 valides et compatibles
+XML 1.0. `remove_comment(row, col)` retire le commentaire sans toucher à la
+valeur de la cellule.
+
+Les commentaires sont écrits comme des notes Excel classiques avec un dessin
+VML minimal. Le texte enrichi, la taille et la position personnalisées ne sont
+pas exposés.
+
+### Lignes et colonnes masquées
+
+```lua
+sh:set_row_hidden(4, true)
+sh:set_column_hidden(7, true)
+
+-- Les rendre de nouveau visibles.
+sh:set_row_hidden(4, false)
+sh:set_column_hidden(7, false)
+```
+
+Les indices sont 0-based, comme pour `write()`.
+
+### Couleur et visibilité des feuilles
+
+```lua
+sh:set_tab_color("4472C4")
+sh:set_visibility("visible")
+```
+
+Les états possibles sont `visible`, `hidden` et `very_hidden`. Un classeur ne
+peut pas être sauvegardé si toutes ses feuilles sont masquées. La feuille active
+doit rester visible.
+
+### Feuille active
+
+```lua
+wb:set_active_sheet("Synthèse")
+-- ou un index 1-based :
+wb:set_active_sheet(2)
+
+local active = wb:get_active_sheet() -- objet sheet en écriture
+```
+
+### Plages et formules nommées
+
+```lua
+wb:define_name("TauxTVA", "'Paramètres'!$B$2")
+wb:define_name("Produits", "'Données'!$A$2:$D$100")
+wb:define_name("TotalLocal", "'Synthèse'!$B$10", {
+  local_sheet = "Synthèse",
+  hidden = true,
+  comment = "Nom local technique",
+})
+```
+
+Les noms sont ASCII, sensibles à la casse lors de l'écriture mais uniques sans
+distinction de casse dans une même portée. Ils doivent commencer par une lettre,
+`_` ou `\`, et ne doivent pas ressembler à une référence de cellule.
+
+```lua
+for _, item in ipairs(wb:get_defined_names()) do
+  print(item.name, item.reference, item.local_sheet, item.hidden)
+end
+
+wb:remove_defined_name("TauxTVA")
+wb:remove_defined_name("TotalLocal", { local_sheet = "Synthèse" })
+```
+
+### Exemple combiné 1.3.0
 
 ```lua
 local xlsx = require("xlsx")
@@ -536,8 +789,20 @@ sh:set_column_width(4, 18)
 sh:set_row_height(0, 30)
 sh:freeze_panes(2, 1)
 sh:set_auto_filter("A2:E4")
+sh:add_data_validation("C3:C100", {
+  type = "whole", operator = "greater_or_equal", value = 0,
+})
+sh:add_conditional_format("D3:D100", {
+  type = "cell", operator = "greater_than", value = 100,
+  style = xlsx.style({ bold = true, fill_color = "C6EFCE" }),
+})
+sh:set_comment(2, 0, { author = "Julien", text = "Produit vedette" })
+sh:set_column_hidden(5, true)
+sh:set_tab_color("4472C4")
 
 wb:add_sheet("Résumé"):write(0, 0, "Destination interne")
+wb:define_name("ZoneVentes", "'Ventes'!$A$3:$E$100")
+wb:set_active_sheet("Ventes")
 assert(wb:save("ventes.xlsx"))
 ```
 
@@ -707,6 +972,22 @@ local first = assert(wb:sheet(1))
 local data = assert(wb:sheet("Données"))
 ```
 
+### Feuille active et noms définis en lecture
+
+```lua
+print(wb:get_active_sheet()) -- nom de la feuille active
+
+for _, item in ipairs(wb:get_defined_names()) do
+  print(item.name, item.reference, item.local_sheet, item.hidden, item.comment)
+end
+
+local global = wb:get_defined_name("TauxTVA")
+local local_name = wb:get_defined_name("TotalLocal", "Synthèse")
+```
+
+`local_sheet` est un index 1-based dans les tables retournées. La recherche
+accepte cet index ou le nom de la feuille.
+
 ### Valeurs et formules
 
 #### `sheet:read(row, col)`
@@ -799,6 +1080,51 @@ print(rows, cols)
 
 ```lua
 print(sheet:get_auto_filter())
+```
+
+#### Lignes, colonnes et propriétés de feuille
+
+```lua
+print(sheet:is_row_hidden(4))
+print(sheet:is_column_hidden(7))
+print(sheet:get_tab_color())
+print(sheet:get_visibility()) -- visible, hidden ou very_hidden
+```
+
+#### Validations de données
+
+```lua
+for _, rule in ipairs(sheet:get_data_validations()) do
+  print(rule.ref, rule.type, rule.operator, rule.formula1, rule.formula2)
+  if rule.values then print(table.concat(rule.values, ", ")) end
+end
+```
+
+Les opérandes lus sont exposés sous forme de chaînes XML/Excel. Les listes
+inline simples sont en plus décodées dans `values`.
+
+#### Mise en forme conditionnelle
+
+```lua
+for _, rule in ipairs(sheet:get_conditional_formats()) do
+  print(rule.ref, rule.type, rule.operator, rule.formula1)
+  if rule.style then print(rule.style.fill_color, rule.style.font_color) end
+end
+```
+
+Les règles reconnues sont exposées dans l'ordre de priorité. Les règles avancées
+inconnues restent diagnostiquables par leur type XML, mais ne sont pas promises
+comme réécrivables.
+
+#### Commentaires
+
+```lua
+local comment = sheet:get_comment(2, 0)
+if comment then print(comment.author, comment.text, comment.ref) end
+
+for _, item in ipairs(sheet:get_comments()) do
+  print(item.row, item.col, item.author, item.text)
+end
 ```
 
 ### Lecture des cellules fusionnées
@@ -1110,7 +1436,10 @@ Le harnais vérifie notamment :
 - CRC corrompu ;
 - systèmes de dates 1900 et 1904 ;
 - styles, formats numériques et dates stylées ;
-- largeurs, hauteurs, volets figés, filtres et formules ;
+- largeurs, hauteurs, volets figés, filtres, fusions et formules ;
+- validations de données, mise en forme conditionnelle et commentaires ;
+- lignes et colonnes masquées, visibilité, couleur d’onglet et feuille active ;
+- plages nommées globales et locales ;
 - limites Excel et XML 1.0 ;
 - appels automatiques à Babet ;
 - non-destruction des DataFrames ;
@@ -1172,8 +1501,13 @@ temporaire et ne laisse pas les fichiers auxiliaires LaTeX dans le projet.
 
 - Écriture ZIP STORED uniquement ; lecture STORED et DEFLATE.
 - Pas de ZIP64 dans le parseur Lua interne.
-- Pas de graphiques, images, validations de données, tableaux structurés ni
-  mise en forme conditionnelle.
+- Pas de graphiques, images, tableaux structurés, tableaux croisés dynamiques
+  ni macros XLSM.
+- La mise en forme conditionnelle se limite aux règles simples documentées ;
+  les barres de données, jeux d’icônes et échelles de couleurs ne sont pas pris
+  en charge.
+- Les commentaires sont lus et écrits comme du texte simple : les fragments
+  riches, dimensions et positions personnalisées ne sont pas conservés.
 - Les formules sont lues et écrites mais ne sont pas calculées. Les formules
   partagées secondaires sans expression résolue ne sont pas réécrites.
 - La lecture des styles couvre le sous-ensemble pris en charge ; les thèmes,

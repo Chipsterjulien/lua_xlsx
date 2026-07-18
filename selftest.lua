@@ -243,7 +243,7 @@ end
 -- ---- PRÉSENTATION ET FORMULES ----------------------------------------------
 print("\n[7] styles, dimensions, volets, filtres et formules")
 do
-  check(xlsx.VERSION == "1.2.0", "version du module 1.2.0")
+  check(xlsx.VERSION == "1.3.0", "version du module 1.3.0")
   local header = xlsx.style({
     bold = true,
     fill_color = "D9EAF7",
@@ -406,6 +406,117 @@ do
   end, "style de bordure inconnu refusé")
   expect_error(function() xlsx.hyperlink("", "vide") end, "cible d'hyperlien vide refusée")
   expect_error(function() xlsx.formula("A1", {}) end, "cache de formule invalide refusé")
+end
+
+
+-- ---- VALIDATIONS, MISE EN FORME CONDITIONNELLE ET MÉTADONNÉES 1.3 ---------
+print("\n[9] validations, mise en forme conditionnelle, commentaires et propriétés")
+do
+  local wb = xlsx.new()
+  local sh = wb:add_sheet("Saisie")
+  sh:write_rows({
+    { "Statut", "Score", "Note", "Technique" },
+    { "Oui", 42, "À vérifier", "masqué" },
+  })
+  sh:add_data_validation("A2:A100", {
+    type = "list", values = { "Oui", "Non", "En attente" },
+    allow_blank = true, show_input_message = true, show_error_message = true,
+    prompt_title = "Choix", prompt = "Sélectionner un statut",
+    error_title = "Erreur", error = "Valeur invalide", error_style = "stop",
+  })
+  sh:add_data_validation("B2:B100", {
+    type = "whole", operator = "between", minimum = 0, maximum = 100,
+  })
+  sh:add_data_validation("C2:C100", {
+    type = "text_length", operator = "less_or_equal", value = 20,
+  })
+  local negative = xlsx.style({ font_color = "9C0006", fill_color = "FFC7CE" })
+  local long_note = xlsx.style({ fill_color = "FFF2CC" })
+  sh:add_conditional_format("B2:B100", {
+    type = "cell", operator = "less_than", value = 0, style = negative,
+  })
+  sh:add_conditional_format("C2:C100", {
+    type = "custom", formula = "LEN(C2)>20", style = long_note, stop_if_true = true,
+  })
+  sh:set_comment(1, 2, { author = "Julien", text = "Valeur à vérifier avant publication." })
+  sh:set_row_hidden(4, true)
+  sh:set_column_hidden(3, true)
+  sh:set_tab_color("4472C4")
+
+  local hidden = wb:add_sheet("Masquée")
+  hidden:set_visibility("hidden")
+  local very_hidden = wb:add_sheet("Très masquée")
+  very_hidden:set_visibility("very_hidden")
+  wb:set_active_sheet("Saisie")
+  wb:define_name("TauxTVA", "'Saisie'!$B$2", { comment = "Taux global" })
+  wb:define_name("ZoneStatut", "'Saisie'!$A$2:$A$100")
+  wb:define_name("LocalScore", "'Saisie'!$B$2", { local_sheet = "Saisie", hidden = true })
+  assert(wb:save(TMP2, { use_babet = false }))
+
+  local read = assert(xlsx.open(TMP2, { use_babet = false }))
+  check(read:get_active_sheet() == "Saisie", "feuille active relue")
+  local names = read:get_defined_names()
+  check(#names == 3 and names[1].name == "TauxTVA" and names[1].comment == "Taux global",
+    "plages nommées relues")
+  check(read:get_defined_name("LocalScore", 1).hidden == true, "nom local masqué relu")
+  local rs = assert(read:sheet("Saisie"))
+  check(rs:get_tab_color() == "FF4472C4", "couleur d'onglet relue")
+  check(rs:is_row_hidden(4) and rs:is_column_hidden(3), "ligne et colonne masquées relues")
+  check(assert(read:sheet("Masquée")):get_visibility() == "hidden"
+      and assert(read:sheet("Très masquée")):get_visibility() == "very_hidden",
+    "visibilités de feuilles relues")
+  local comment = rs:get_comment(1, 2)
+  check(comment and comment.author == "Julien" and comment.text:match("vérifier"), "commentaire relu")
+  check(#rs:get_comments() == 1, "liste des commentaires exposée")
+  local validations = rs:get_data_validations()
+  check(#validations == 3 and validations[1].type == "list"
+      and table.concat(validations[1].values, ",") == "Oui,Non,En attente",
+    "validation de liste relue")
+  check(validations[2].type == "whole" and validations[2].operator == "between"
+      and validations[2].formula1 == "0" and validations[2].formula2 == "100",
+    "validation numérique relue")
+  local formats = rs:get_conditional_formats()
+  check(#formats == 2 and formats[1].type == "cell" and formats[1].operator == "less_than"
+      and formats[1].style.fill_color == "FFFFC7CE", "format conditionnel cell relu")
+  check(formats[2].type == "custom" and formats[2].stop_if_true == true
+      and formats[2].formula1 == "LEN(C2)>20", "format conditionnel custom relu")
+
+  local temp = xlsx.new()
+  local ts = temp:add_sheet("x")
+  ts:add_data_validation("A1", { type = "list", values = { "Oui", "Non" } })
+  ts:remove_data_validation("A1")
+  check(#ts:get_data_validations() == 0, "suppression d'une validation")
+  ts:add_conditional_format("A1", { type = "blanks", style = xlsx.style({ fill_color = "FFFF00" }) })
+  ts:remove_conditional_format("A1")
+  check(#ts:get_conditional_formats() == 0, "suppression d'un format conditionnel")
+  ts:set_comment(0, 0, { author = "A", text = "B" }):remove_comment(0, 0)
+  check(true, "suppression d'un commentaire")
+
+  expect_error(function()
+    xlsx.new():add_sheet("x"):add_data_validation("A1", { type = "list", values = { "a,b" } })
+  end, "choix inline ambigu refusé")
+  expect_error(function()
+    xlsx.new():add_sheet("x"):add_data_validation("A1", { type = "whole", operator = "between", minimum = 0 })
+  end, "validation between incomplète refusée")
+  expect_error(function()
+    xlsx.new():add_sheet("x"):add_conditional_format("A1", { type = "cell", operator = "less_than", value = 0, style = {} })
+  end, "style conditionnel brut refusé")
+  expect_error(function()
+    xlsx.new():add_sheet("x"):add_conditional_format("A1", {
+      type = "cell", operator = "less_than", value = 0,
+      style = xlsx.style({ number_format = "0.00" }),
+    })
+  end, "format numérique conditionnel non pris en charge refusé")
+  expect_error(function()
+    xlsx.new():add_sheet("x"):set_comment(0, 0, { author = "", text = "x" })
+  end, "auteur de commentaire vide refusé")
+  expect_error(function() xlsx.new():define_name("A1", "Feuil1!A1") end,
+    "nom défini ressemblant à une cellule refusé")
+  do
+    local bad = xlsx.new(); bad:add_sheet("x"):set_visibility("hidden")
+    local ok, err = bad:save(TMP2, { use_babet = false })
+    check(ok == nil and type(err) == "string", "classeur sans feuille visible refusé")
+  end
 end
 
 os.remove(TMP)

@@ -4,7 +4,7 @@ Reference for the `xlsx` and `dataframe` modules. Babet with Lua 5.5 is the
 primary target, while the pure-Lua core remains compatible with standard Lua
 5.3+.
 
-Documentation for lua-xlsx 1.2.0.
+Documentation for lua-xlsx 1.3.0.
 
 ## Contents
 
@@ -138,14 +138,14 @@ sh:write_rows({
 
 ## Styles, structure, layout, hyperlinks and formulas
 
-Version 1.2.0 writes these elements and also exposes the supported subset
+Version 1.3.0 writes these elements and also exposes the supported subset
 through the reading API. `style`, `formula`, and `hyperlink` objects are
 immutable.
 
 ### `xlsx.VERSION`
 
 ```lua
-assert(xlsx.VERSION == "1.2.0")
+assert(xlsx.VERSION == "1.3.0")
 ```
 
 ### `xlsx.style([opts]) -> style`
@@ -355,7 +355,175 @@ sh:write(4, 1, xlsx.formula("SUM(B2:B4)", 42.5))
 The optional cached value may be a string, number, or boolean. It is not
 verified against the formula. lua-xlsx does not calculate formulas.
 
-### Complete 1.2.0 example
+### Data validation
+
+#### `sheet:add_data_validation(range, opts) -> sheet`
+
+Supported types are `list`, `whole`, `decimal`, `date`, `time`, `text_length`
+and `custom`. Numeric-like types accept `between`, `not_between`, `equal`,
+`not_equal`, `greater_than`, `less_than`, `greater_or_equal` and
+`less_or_equal`.
+
+Inline list:
+
+```lua
+sheet:add_data_validation("A2:A100", {
+  type = "list",
+  values = { "Yes", "No", "Pending" },
+})
+```
+
+Inline choices cannot contain commas or double quotes and the generated formula
+is limited to 255 bytes. Use a defined name for larger lists:
+
+```lua
+workbook:define_name("Statuses", "'Settings'!$A$1:$A$20")
+sheet:add_data_validation("A2:A100", {
+  type = "list",
+  formula = "Statuses",
+})
+```
+
+Whole number between two bounds:
+
+```lua
+sheet:add_data_validation("B2:B100", {
+  type = "whole",
+  operator = "between",
+  minimum = 0,
+  maximum = 100,
+})
+```
+
+Date and custom formula:
+
+```lua
+sheet:add_data_validation("C2:C100", {
+  type = "date",
+  operator = "greater_than",
+  value = xlsx.date(2026, 1, 1),
+})
+
+sheet:add_data_validation("D2:D100", {
+  type = "custom",
+  formula = "MOD(D2,2)=0",
+})
+```
+
+Input and error messages use `allow_blank`, `show_dropdown`,
+`show_input_message`, `prompt_title`, `prompt`, `show_error_message`,
+`error_style`, `error_title` and `error`. `error_style` accepts `stop`,
+`warning` or `information`.
+
+`remove_data_validation(range)` removes rules attached exactly to that range.
+`get_data_validations()` returns independent copies.
+
+### Conditional formatting
+
+#### `sheet:add_conditional_format(range, opts) -> sheet`
+
+A style created by `xlsx.style()` is required. Conditional styles support font,
+solid fill and the four borders. Number formats and alignment are deliberately
+rejected.
+
+```lua
+local negative = xlsx.style({
+  font_color = "9C0006",
+  fill_color = "FFC7CE",
+})
+
+sheet:add_conditional_format("B2:B100", {
+  type = "cell",
+  operator = "less_than",
+  value = 0,
+  style = negative,
+})
+```
+
+Other supported rule types:
+
+```lua
+sheet:add_conditional_format("C2:C100", {
+  type = "contains_text",
+  text = "urgent",
+  style = xlsx.style({ bold = true, font_color = "C00000" }),
+})
+
+sheet:add_conditional_format("D2:D100", {
+  type = "blanks", -- also not_blanks or duplicate
+  style = xlsx.style({ fill_color = "FFFF00" }),
+})
+
+sheet:add_conditional_format("A2:D100", {
+  type = "custom",
+  formula = "$D2>1000",
+  stop_if_true = true,
+  style = xlsx.style({ bold = true, fill_color = "C6EFCE" }),
+})
+```
+
+Cell rules use the same comparison operators as validation and accept either
+`value` or `minimum`/`maximum`. `remove_conditional_format(range)` removes
+rules attached exactly to the range. Priorities follow insertion order.
+
+### Cell comments
+
+```lua
+sheet:set_comment(2, 0, {
+  author = "Julien",
+  text = "Check this value before publishing.",
+})
+
+sheet:remove_comment(2, 0)
+```
+
+Comments are classic Excel notes with plain text. Rich text, custom dimensions
+and custom positions are not exposed.
+
+### Hidden rows and columns
+
+```lua
+sheet:set_row_hidden(4, true)
+sheet:set_column_hidden(7, true)
+```
+
+Pass `false` to make the row or column visible again. Indices are zero-based.
+
+### Sheet properties and active sheet
+
+```lua
+sheet:set_tab_color("4472C4")
+sheet:set_visibility("hidden") -- visible, hidden or very_hidden
+workbook:set_active_sheet("Summary")
+```
+
+At least one sheet must remain visible and the active sheet must be visible.
+`workbook:get_active_sheet()` returns the writable sheet object.
+
+### Defined names
+
+```lua
+workbook:define_name("VATRate", "'Settings'!$B$2")
+workbook:define_name("Products", "'Data'!$A$2:$D$100")
+workbook:define_name("LocalTotal", "'Summary'!$B$10", {
+  local_sheet = "Summary",
+  hidden = true,
+  comment = "Technical local name",
+})
+```
+
+Names use a conservative ASCII syntax, are case-insensitively unique within a
+scope, and cannot look like a cell reference.
+
+```lua
+for _, item in ipairs(workbook:get_defined_names()) do
+  print(item.name, item.reference, item.local_sheet)
+end
+
+workbook:remove_defined_name("VATRate")
+```
+
+### Complete 1.3.0 example
 
 ```lua
 local xlsx = require("xlsx")
@@ -527,6 +695,22 @@ local sheet = assert(wb:sheet("Data"))
 
 `sheet()` also accepts a one-based sheet index.
 
+The active sheet and defined names are available separately:
+
+```lua
+print(wb:get_active_sheet()) -- active sheet name
+
+for _, item in ipairs(wb:get_defined_names()) do
+  print(item.name, item.reference, item.local_sheet, item.hidden, item.comment)
+end
+
+local global = wb:get_defined_name("VATRate")
+local local_name = wb:get_defined_name("LocalTotal", "Summary")
+```
+
+`local_sheet` is a one-based sheet index in returned tables; lookup accepts the
+index or sheet name.
+
 ### Values and formulas
 
 `sheet:read(row, col)` keeps the historical contract and returns the cached
@@ -567,7 +751,37 @@ print(sheet:get_row_height(0))
 local rows, cols = sheet:get_frozen_panes()
 print(rows, cols)
 print(sheet:get_auto_filter())
+print(sheet:is_row_hidden(4))
+print(sheet:is_column_hidden(7))
+print(sheet:get_tab_color())
+print(sheet:get_visibility())
 ```
+
+### Data validation, conditional formatting and comments
+
+```lua
+for _, rule in ipairs(sheet:get_data_validations()) do
+  print(rule.ref, rule.type, rule.operator, rule.formula1, rule.formula2)
+  if rule.values then print(table.concat(rule.values, ", ")) end
+end
+
+for _, rule in ipairs(sheet:get_conditional_formats()) do
+  print(rule.ref, rule.type, rule.operator, rule.formula1)
+  if rule.style then print(rule.style.fill_color) end
+end
+
+local comment = sheet:get_comment(2, 0)
+if comment then print(comment.author, comment.text, comment.ref) end
+
+for _, item in ipairs(sheet:get_comments()) do
+  print(item.row, item.col, item.author, item.text)
+end
+```
+
+Validation operands are exposed as Excel/XML strings. Simple inline lists are
+also decoded into `values`. Conditional rules are returned in priority order.
+Advanced unknown rules may be inspected by their XML type but are not promised
+to be writable again.
 
 ### Merged cells
 
@@ -782,8 +996,10 @@ longer reports success after a real write failure.
 
 The harness covers write/read round trips, Unicode, XML entities, CRC corruption,
 1900/1904 dates, styles and number formats, dimensions, frozen panes, filters,
-formulas, Excel and XML limits, Babet calls, DataFrame copy semantics,
-collision-free grouping and real openpyxl interoperability.
+merges and formulas, data validation, conditional formatting, comments, hidden
+rows and columns, sheet visibility, tab colors, active-sheet selection, global
+and local defined names, Excel and XML limits, Babet calls, DataFrame copy
+semantics, collision-free grouping and real openpyxl interoperability.
 
 Babet is resolved in this order: `BABET_BIN`, the local `bin/babet` file, then
 `babet` from `PATH`. The harness creates a temporary Python virtual environment,
@@ -829,8 +1045,11 @@ temporary directory.
 
 - Writing uses STORED ZIP entries; reading supports STORED and DEFLATE.
 - The internal Lua parser does not support ZIP64.
-- No charts, images, data validation, structured tables, or conditional
-  formatting.
+- No charts, images, structured tables, pivot tables, or XLSM macros.
+- Conditional formatting is limited to the documented simple rules; data bars,
+  icon sets, and color scales are not supported.
+- Comments are read and written as plain text; rich-text runs, custom dimensions,
+  and custom positions are not preserved.
 - Formulas are read and written but not calculated. Secondary shared formulas
   without a resolved expression are not written back.
 - Style reading covers the supported subset; themes, indexed colors, diagonal
