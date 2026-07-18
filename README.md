@@ -20,16 +20,19 @@ constituent la cible principale et recommandée.
   masquées, couleur d'onglet et visibilité des feuilles.
 - Validations de données : listes, nombres, dates, heures, longueurs de texte
   et formules personnalisées.
-- Mise en forme conditionnelle simple : comparaisons, texte, cellules vides,
-  doublons et formules personnalisées.
+- Mise en forme conditionnelle : règles classiques, échelles de couleurs,
+  barres de données, jeux d’icônes, classements et comparaison à la moyenne.
 - Commentaires de cellules, hyperliens externes et internes, feuille active
   et plages nommées globales ou locales.
-- Rapports : images PNG/JPEG, graphiques linéaires ou en barres/colonnes,
-  tableaux structurés Excel, zones d’impression, titres répétés, marges,
-  orientation, papier, en-têtes et pieds de page.
+- Rapports : images PNG/JPEG, graphiques en courbes, colonnes, barres, secteurs,
+  anneaux, aires et nuages de points, tableaux structurés, sparklines, zones
+  d’impression, titres répétés, sauts de page, marges, en-têtes et pieds de page.
+- Finition : texte enrichi dans les cellules, protection des cellules, feuilles
+  et structure du classeur, ainsi que propriétés principales du document.
 - Lecture des formules, styles, dimensions, fusions, volets, filtres, liens,
   validations, règles conditionnelles, commentaires, propriétés de feuilles,
-  images, graphiques, tableaux et paramètres d’impression.
+  texte enrichi, protections, sparklines, images, graphiques, tableaux,
+  propriétés du document et paramètres d’impression.
 - Lecture des ZIP XLSX STORED ou DEFLATE avec un décompresseur DEFLATE Lua.
 - Contrôle du CRC-32, des tailles, des offsets, des doublons, du chiffrement,
   des chevauchements et des rapports de compression.
@@ -106,10 +109,26 @@ sh:add_conditional_format("B3:B100", {
 sh:set_comment(2, 0, { author = "Julien", text = "Valeur contrôlée." })
 sh:set_column_hidden(4, true)
 sh:set_tab_color("4472C4")
+sh:write_rich_text(4, 0, {
+  { text = "Attention : ", bold = true, font_color = "FF0000" },
+  { text = "valeur à vérifier", italic = true },
+})
+sh:add_conditional_format("B3:B100", {
+  type = "color_scale",
+  min_color = "F8696B", mid_type = "percentile", mid_value = 50,
+  mid_color = "FFEB84", max_color = "63BE7B",
+})
+sh:add_sparkline("E3", "B3:D3", {
+  type = "line", show_high = true, show_low = true,
+})
+sh:protect({ password = "lecture", select_unlocked_cells = true })
+sh:add_row_page_break(40)
 sh:add_table("A2:D3", { name = "RapportTable", style = "TableStyleMedium2" })
 sh:add_chart({
-  type = "column", title = "Montants", categories = "A3:A3",
-  series = { { name_ref = "B2", values = "B3:B3" } },
+  type = "doughnut", title = "Montants", categories = "A3:A3",
+  series = { { name_ref = "B2", values = "B3:B3", color = "4472C4" } },
+  hole_size = 60, legend_position = "bottom",
+  data_labels = { show_percent = true },
   row = 1, col = 5,
 })
 sh:set_page_setup({
@@ -121,6 +140,10 @@ sh:set_print_area("A1:J30")
 sh:set_print_titles({ rows = "1:2", columns = "A:A" })
 
 wb:define_name("ZoneMontants", "'Rapport'!$B$3:$B$100")
+wb:set_properties({
+  title = "Rapport", creator = "lua-xlsx", company = "Mon entreprise",
+})
+wb:protect({ password = "structure", structure = true })
 wb:set_active_sheet("Rapport")
 
 local ok, err = wb:save("rapport.xlsx")
@@ -164,6 +187,14 @@ local comment = sh:get_comment(2, 0)
 print(comment and comment.author, comment and comment.text)
 print(wb:get_active_sheet(), #wb:get_defined_names())
 print(#sh:get_images(), #sh:get_charts(), #sh:get_tables())
+print(#sh:get_sparklines(), #sh:get_row_page_breaks())
+local rich = sh:get_rich_text(4, 0)
+if rich then
+  for _, run in ipairs(xlsx.rich_text_runs(rich)) do
+    print(run.text, run.bold, run.italic)
+  end
+end
+print(wb:get_properties().title, wb:get_protection() ~= nil)
 local page = sh:get_page_setup()
 local repeat_rows, repeat_cols = sh:get_print_titles()
 print(page and page.orientation, sh:get_print_area(), repeat_rows, repeat_cols)
@@ -272,11 +303,12 @@ fichiers Markdown. Il nécessite Pandoc et XeLaTeX ou LuaLaTeX.
 
 ## Limites actuelles
 
-- Pas de tableaux croisés dynamiques, macros XLSM, graphiques combinés,
-  graphiques circulaires, images SVG ou mise en page avancée par zones multiples.
-- La mise en forme conditionnelle se limite aux règles simples documentées ;
-  les barres de données, jeux d'icônes et échelles de couleurs ne sont pas pris
-  en charge.
+- Pas de tableaux croisés dynamiques, macros XLSM, graphiques combinés ou 3D,
+  axe secondaire, images SVG ou mise en page avancée par zones multiples.
+- Les sparklines sont écrites dans l’extension OOXML standard. `openpyxl 3.1.5`
+  peut lire le classeur, mais ne conserve pas cette extension s’il le réenregistre.
+- La protection XLSX classique limite les mots de passe à 15 octets et ne
+  constitue pas un chiffrement du contenu.
 - Les commentaires sont lus et écrits comme du texte simple : les fragments
   riches, dimensions et positions personnalisées ne sont pas conservés.
 - Les formules sont lues et écrites, mais lua-xlsx ne les calcule pas. Une

@@ -4,7 +4,7 @@ Reference for the `xlsx` and `dataframe` modules. Babet with Lua 5.5 is the
 primary target, while the pure-Lua core remains compatible with standard Lua
 5.3+.
 
-Documentation for lua-xlsx 1.4.0.
+Documentation for lua-xlsx 1.5.0.
 
 ## Contents
 
@@ -13,6 +13,7 @@ Documentation for lua-xlsx 1.4.0.
 - [Writing XLSX files](#writing-xlsx-files)
 - [Styles, structure, layout, hyperlinks and formulas](#styles-structure-layout-hyperlinks-and-formulas)
 - [Reports, charts, images, and printing](#reports-charts-images-and-printing)
+- [Finishing, advanced visualization, and protection](#finishing-advanced-visualization-and-protection)
 - [1900 and 1904 dates](#1900-and-1904-dates)
 - [Reading XLSX files](#reading-xlsx-files)
 - [ZIP validation and limits](#zip-validation-and-limits)
@@ -139,14 +140,14 @@ sh:write_rows({
 
 ## Styles, structure, layout, hyperlinks and formulas
 
-Version 1.4.0 writes these elements and also exposes the supported subset
-through the reading API. `style`, `formula`, and `hyperlink` objects are
-immutable.
+Version 1.5.0 writes these elements and also exposes the supported subset
+through the reading API. `style`, `formula`, `hyperlink`, and `rich_text`
+objects are immutable.
 
 ### `xlsx.VERSION`
 
 ```lua
-assert(xlsx.VERSION == "1.4.0")
+assert(xlsx.VERSION == "1.5.0")
 ```
 
 ### `xlsx.style([opts]) -> style`
@@ -168,6 +169,8 @@ A style must be created with `xlsx.style`; raw option tables are rejected by
 | `vertical` | string | `top`, `center`, `bottom`, `justify` |
 | `wrap_text` | boolean | wrap text |
 | `number_format` | string | alias or Excel format code |
+| `locked` | boolean | locked when worksheet protection is enabled |
+| `hidden` | boolean | formula hidden when worksheet protection is enabled |
 | `border` | table | `left`, `right`, `top`, `bottom` sides |
 
 Six-digit RGB colors automatically receive an opaque `FF` alpha channel.
@@ -929,6 +932,603 @@ sh:set_print_titles({ rows = "1:1", columns = "A:A" })
 assert(wb:save("dashboard.xlsx"))
 ```
 
+## Finishing, advanced visualization, and protection
+
+Version 1.5.0 extends the reporting features introduced in 1.4.0 with richer
+visual elements, classic XLSX protection, document metadata, and rich text.
+
+### Rich text inside a cell
+
+#### `xlsx.rich_text(runs) -> rich_text`
+
+Creates a value made of several text runs. Every run requires `text` and may
+set:
+
+- `bold`;
+- `italic`;
+- `underline`: `"single"` or `"double"`;
+- `strike`;
+- `font_name`;
+- `font_size`;
+- `font_color`.
+
+```lua
+local warning = xlsx.rich_text({
+  { text = "Warning: ", bold = true, font_color = "FF0000" },
+  { text = "the deadline is Friday.", italic = true },
+})
+
+sheet:write(0, 0, warning)
+```
+
+The convenience method avoids creating the value explicitly:
+
+```lua
+sheet:write_rich_text(1, 0, {
+  { text = "Total: ", bold = true },
+  { text = "€1,250", font_color = "008000", underline = "single" },
+})
+```
+
+A complete cell style may be supplied separately:
+
+```lua
+sheet:write_rich_text(2, 0, {
+  { text = "Status: ", bold = true },
+  { text = "approved", italic = true, font_color = "008000" },
+}, xlsx.style({ fill_color = "E2F0D9", wrap_text = true }))
+```
+
+#### `xlsx.is_rich_text(value)` and `xlsx.rich_text_runs(value)`
+
+`is_rich_text()` identifies a rich-text value. `rich_text_runs()` returns an
+independent copy of its runs.
+
+```lua
+local rich = sheet:get_rich_text(0, 0)
+if rich and xlsx.is_rich_text(rich) then
+  for _, run in ipairs(xlsx.rich_text_runs(rich)) do
+    print(run.text, run.bold, run.italic, run.font_color)
+  end
+end
+```
+
+`sheet:read()` still returns the concatenated plain text, preserving a simple
+reading path for programs that do not need the individual runs.
+
+### Visual conditional formatting
+
+The following rules do not use a differential `style`. They generate native
+spreadsheet visualizations.
+
+#### Two-color scale
+
+```lua
+sheet:add_conditional_format("B2:B100", {
+  type = "color_scale",
+  min_color = "F8696B",
+  max_color = "63BE7B",
+})
+```
+
+The default thresholds are `min` and `max`.
+
+#### Three-color scale
+
+```lua
+sheet:add_conditional_format("B2:B100", {
+  type = "color_scale",
+  min_type = "number",
+  min_value = 0,
+  min_color = "F8696B",
+  mid_type = "percentile",
+  mid_value = 50,
+  mid_color = "FFEB84",
+  max_type = "number",
+  max_value = 100,
+  max_color = "63BE7B",
+})
+```
+
+Threshold types are `min`, `max`, `number`, `percent`, `percentile`, and
+`formula`. `min` and `max` thresholds do not accept a value.
+
+#### Data bar
+
+```lua
+sheet:add_conditional_format("C2:C100", {
+  type = "data_bar",
+  start_type = "min",
+  end_type = "max",
+  color = "5B9BD5",
+  show_value = true,
+})
+```
+
+Numeric bounds can be used explicitly:
+
+```lua
+sheet:add_conditional_format("C2:C100", {
+  type = "data_bar",
+  start_type = "number",
+  start_value = 0,
+  end_type = "number",
+  end_value = 500,
+  color = "70AD47",
+  show_value = false,
+})
+```
+
+#### Icon set
+
+```lua
+sheet:add_conditional_format("D2:D100", {
+  type = "icon_set",
+  icons = "3_traffic_lights",
+  value_type = "number",
+  values = { 0, 50, 80 },
+  show_value = true,
+  reverse = false,
+})
+```
+
+Supported sets:
+
+- `3_arrows`, `3_arrows_gray`, `3_flags`;
+- `3_traffic_lights`, `3_traffic_lights_rimmed`;
+- `3_signs`, `3_symbols`, `3_symbols_circled`;
+- `4_arrows`, `4_arrows_gray`, `4_ratings`, `4_traffic_lights`;
+- `5_arrows`, `5_arrows_gray`, `5_ratings`, `5_quarters`.
+
+The threshold count must match the number in the set name.
+
+#### Top, bottom, and average rules
+
+```lua
+local highlight = xlsx.style({
+  bold = true,
+  font_color = "006100",
+  fill_color = "C6EFCE",
+})
+
+sheet:add_conditional_format("B2:B100", {
+  type = "top",
+  rank = 10,
+  percent = false,
+  style = highlight,
+})
+
+sheet:add_conditional_format("C2:C100", {
+  type = "bottom",
+  rank = 5,
+  percent = true,
+  style = xlsx.style({ fill_color = "FFC7CE" }),
+})
+
+sheet:add_conditional_format("D2:D100", {
+  type = "above_average",
+  style = highlight,
+})
+
+sheet:add_conditional_format("E2:E100", {
+  type = "below_average",
+  style = xlsx.style({ font_color = "9C0006" }),
+})
+```
+
+### Sparklines
+
+#### `sheet:add_sparkline(target, source [, opts]) -> sheet`
+
+Adds a mini-chart to one cell. The target must be a single cell and the source
+a range on the same worksheet.
+
+Line sparkline:
+
+```lua
+sheet:add_sparkline("N2", "B2:M2", {
+  type = "line",
+  color = "4472C4",
+  show_markers = true,
+  show_high = true,
+  show_low = true,
+  high_color = "00B050",
+  low_color = "C00000",
+})
+```
+
+Column sparkline:
+
+```lua
+sheet:add_sparkline("N3", "B3:M3", {
+  type = "column",
+  color = "5B9BD5",
+  show_negative = true,
+  negative_color = "C00000",
+  show_first = true,
+  show_last = true,
+})
+```
+
+Win/loss sparkline:
+
+```lua
+sheet:add_sparkline("N4", "B4:M4", {
+  type = "win_loss",
+  color = "70AD47",
+  right_to_left = false,
+})
+```
+
+Available options are `type`, `color`, `negative_color`, `high_color`,
+`low_color`, `first_color`, `last_color`, `show_markers`, `show_high`,
+`show_low`, `show_first`, `show_last`, `show_negative`, and `right_to_left`.
+
+```lua
+sheet:remove_sparkline("N3")
+local sparklines = sheet:get_sparklines()
+```
+
+Sparklines use the standard OOXML `x14` extension. Excel and LibreOffice
+understand it. `openpyxl 3.1.5` warns that it does not support that extension
+and removes it when it saves the workbook again.
+
+### Advanced charts
+
+`sheet:add_chart()` now accepts:
+
+- `line`;
+- `column`;
+- `bar`;
+- `pie`;
+- `doughnut`;
+- `area`;
+- `scatter`.
+
+#### Pie chart
+
+```lua
+sheet:add_chart({
+  type = "pie",
+  title = "Sales distribution",
+  categories = "A2:A6",
+  series = {
+    { name = "Sales", values = "B2:B6" },
+  },
+  legend_position = "bottom",
+  data_labels = {
+    show_percent = true,
+    show_category = true,
+    position = "best_fit",
+  },
+  row = 1,
+  col = 4,
+})
+```
+
+A `pie` or `doughnut` chart requires exactly one series.
+
+#### Doughnut chart
+
+```lua
+sheet:add_chart({
+  type = "doughnut",
+  title = "Distribution",
+  categories = "A2:A6",
+  series = {
+    { name_ref = "B1", values = "B2:B6" },
+  },
+  hole_size = 65,
+  legend_position = "right",
+  row = 18,
+  col = 4,
+})
+```
+
+`hole_size` accepts a value from 10 to 90.
+
+#### Stacked area chart
+
+```lua
+sheet:add_chart({
+  type = "area",
+  title = "Cumulative trend",
+  categories = "A2:A13",
+  grouping = "stacked",
+  series = {
+    { name = "Product A", values = "B2:B13", color = "4472C4" },
+    { name = "Product B", values = "C2:C13", color = "ED7D31" },
+  },
+  x_axis = { title = "Month" },
+  y_axis = {
+    title = "Sales",
+    min = 0,
+    max = 10000,
+    number_format = '$#,##0',
+    major_gridlines = true,
+  },
+  legend_position = "top",
+  row = 35,
+  col = 4,
+})
+```
+
+`grouping` accepts `standard`, `stacked`, and `percent_stacked` for line, area,
+column, and bar charts.
+
+#### Scatter chart
+
+```lua
+sheet:add_chart({
+  type = "scatter",
+  title = "Temperature and consumption",
+  x_values = "A2:A50",
+  series = {
+    {
+      name = "Consumption",
+      values = "B2:B50",
+      color = "70AD47",
+      marker = "circle",
+      line_width = 2,
+      smooth = true,
+    },
+  },
+  x_axis = { title = "Temperature", min = -10, max = 40 },
+  y_axis = { title = "kWh", min = 0, major_gridlines = true },
+  legend = false,
+  row = 52,
+  col = 4,
+})
+```
+
+Each scatter series may provide its own `x_values`. Otherwise the chart-level
+`x_values` is used.
+
+#### Shared options
+
+Legend positions: `right`, `left`, `top`, `bottom`, `top_right`.
+
+Series options:
+
+- `name` or `name_ref`;
+- `values`;
+- `x_values` for scatter charts;
+- `color`;
+- `marker`;
+- `line_width`, from 0.25 to 20 points;
+- `smooth`.
+
+Markers: `none`, `circle`, `dash`, `diamond`, `dot`, `picture`, `plus`,
+`square`, `star`, `triangle`, `x`.
+
+Data labels accept `show_value`, `show_percent`, `show_category`,
+`show_series_name`, and `position`. Positions: `center`, `inside_end`,
+`inside_base`, `outside_end`, `best_fit`, `left`, `right`, `top`, `bottom`.
+
+Axes accept `title`, `min`, `max`, `number_format`, and `major_gridlines`. The
+minimum must be strictly lower than the maximum.
+
+### Cell protection
+
+The `locked` and `hidden` options are part of `xlsx.style()`:
+
+```lua
+local input_cell = xlsx.style({
+  fill_color = "FFF2CC",
+  locked = false,
+})
+
+local protected_formula = xlsx.style({
+  number_format = "0.00",
+  locked = true,
+  hidden = true,
+})
+
+sheet:write(1, 1, 12.5, input_cell)
+sheet:write(1, 2, xlsx.formula("=B2*1.2", 15), protected_formula)
+```
+
+These attributes become effective only when the worksheet is protected.
+
+### Worksheet protection
+
+#### `sheet:protect([opts | false]) -> sheet`
+
+```lua
+sheet:protect({
+  password = "secret",
+  select_locked_cells = false,
+  select_unlocked_cells = true,
+  format_cells = false,
+  format_columns = false,
+  format_rows = false,
+  insert_columns = false,
+  insert_rows = false,
+  insert_hyperlinks = false,
+  delete_columns = false,
+  delete_rows = false,
+  sort = false,
+  auto_filter = true,
+  pivot_tables = false,
+  objects = false,
+  scenarios = false,
+})
+```
+
+Every option is boolean. `sheet:protect(false)` removes protection.
+
+```lua
+local protection = sheet:get_protection()
+print(protection and protection.password_hash)
+```
+
+### Workbook structure protection
+
+#### `workbook:protect([opts | false]) -> workbook`
+
+```lua
+workbook:protect({
+  password = "secret",
+  structure = true,
+  windows = false,
+})
+```
+
+`structure` prevents ordinary sheet-structure changes. `windows` protects
+workbook windows in applications that support the option.
+
+```lua
+workbook:protect(false)
+local protection = workbook:get_protection()
+```
+
+Classic XLSX protection is **not encryption**. The password is transformed with
+an old hash and is limited to 15 bytes. It primarily prevents accidental edits.
+
+### Manual page breaks
+
+```lua
+sheet:add_row_page_break(40)
+sheet:add_row_page_break(80)
+sheet:add_column_page_break("H")
+sheet:add_column_page_break(12)
+```
+
+Rows and columns are **1-based** here, matching XLSX storage. A column can be
+provided as letters or as a number.
+
+```lua
+local rows = sheet:get_row_page_breaks()
+local columns = sheet:get_column_page_breaks()
+
+sheet:clear_page_breaks()
+```
+
+### Document properties
+
+#### `workbook:set_properties(opts) -> workbook`
+
+```lua
+workbook:set_properties({
+  title = "Annual report",
+  subject = "2026 results",
+  creator = "Julien Freyermuth",
+  description = "Report generated with lua-xlsx",
+  keywords = { "report", "sales", "2026" },
+  category = "Reporting",
+  company = "My company",
+  manager = "Department manager",
+})
+```
+
+`keywords` accepts either a string or a dense string array. Core properties are
+written to `docProps/core.xml`; `company` and `manager` are written to
+`docProps/app.xml`.
+
+```lua
+local properties = workbook:get_properties()
+print(properties.title, properties.creator, properties.company)
+
+workbook:set_properties(false)
+```
+
+### Reading 1.5 information
+
+Objects returned by `xlsx.open()` expose:
+
+```lua
+local properties = workbook:get_properties()
+local workbook_protection = workbook:get_protection()
+
+local rich = sheet:get_rich_text(row, col)
+local sheet_protection = sheet:get_protection()
+local row_breaks = sheet:get_row_page_breaks()
+local column_breaks = sheet:get_column_page_breaks()
+local sparklines = sheet:get_sparklines()
+local rules = sheet:get_conditional_formats()
+local charts = sheet:get_charts()
+```
+
+`get_charts()` returns the type, series references, grouping, legend, data
+labels, supported axis settings, colors, markers, and line width.
+
+### Complete 1.5.0 example
+
+```lua
+local xlsx = require("xlsx")
+
+local wb = xlsx.new()
+wb:set_properties({
+  title = "2026 dashboard",
+  creator = "lua-xlsx",
+  company = "My company",
+})
+wb:protect({ password = "structure", structure = true })
+
+local sh = wb:add_sheet("Dashboard")
+sh:write_rows({
+  { "Month", "Sales", "Target", "Difference", "Trend" },
+  { "January", 120, 100, 20 },
+  { "February", 90, 110, -20 },
+  { "March", 145, 130, 15 },
+})
+
+sh:write_rich_text(5, 0, {
+  { text = "Legend: ", bold = true },
+  { text = "green = target reached", font_color = "008000" },
+})
+
+sh:add_conditional_format("B2:B4", {
+  type = "color_scale",
+  min_color = "F8696B",
+  mid_type = "percentile",
+  mid_value = 50,
+  mid_color = "FFEB84",
+  max_color = "63BE7B",
+})
+
+sh:add_conditional_format("D2:D4", {
+  type = "icon_set",
+  icons = "3_traffic_lights",
+  value_type = "number",
+  values = { -10, 0, 10 },
+})
+
+for row = 2, 4 do
+  sh:add_sparkline("E" .. row, "B" .. row .. ":D" .. row, {
+    type = "line",
+    color = "4472C4",
+    show_high = true,
+    show_low = true,
+  })
+end
+
+sh:add_chart({
+  type = "area",
+  title = "Sales and targets",
+  categories = "A2:A4",
+  series = {
+    { name_ref = "B1", values = "B2:B4", color = "4472C4" },
+    { name_ref = "C1", values = "C2:C4", color = "ED7D31" },
+  },
+  grouping = "standard",
+  legend_position = "bottom",
+  x_axis = { title = "Month" },
+  y_axis = { title = "Value", min = 0 },
+  row = 0,
+  col = 6,
+})
+
+sh:write(1, 1, 120, xlsx.style({ locked = false, fill_color = "FFF2CC" }))
+sh:protect({ password = "input", select_unlocked_cells = true })
+sh:add_row_page_break(40)
+sh:set_print_area("A1:M40")
+
+assert(wb:save("dashboard.xlsx"))
+```
+
+---
+
 ## 1900 and 1904 dates
 
 ```lua
@@ -1326,9 +1926,12 @@ temporary directory.
 
 - Writing uses STORED ZIP entries; reading supports STORED and DEFLATE.
 - The internal Lua parser does not support ZIP64.
-- No pivot tables, XLSM macros, combined charts, pie charts, SVG images, or advanced multi-area page layouts.
-- Conditional formatting is limited to the documented simple rules; data bars,
-  icon sets, and color scales are not supported.
+- No pivot tables, XLSM macros, combined or 3D charts, secondary axis, SVG
+  images, or advanced multi-area page layouts.
+- Sparklines use the OOXML `x14` extension. Excel and LibreOffice preserve it,
+  while `openpyxl 3.1.5` removes it when saving the workbook again.
+- Classic XLSX protection does not encrypt the workbook and limits passwords to
+  15 bytes.
 - Comments are read and written as plain text; rich-text runs, custom dimensions,
   and custom positions are not preserved.
 - Formulas are read and written but not calculated. Secondary shared formulas

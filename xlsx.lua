@@ -21,7 +21,7 @@
 --- d'archive et d'écriture atomique. Sans Babet, un chemin de repli Lua pur
 --- conserve l'API et applique ses propres contrôles de taille, CRC et ZIP.
 
-local xlsx = { VERSION = "1.4.0" }
+local xlsx = { VERSION = "1.5.0" }
 
 local function get_babet()
   local runtime = rawget(_G, "babet")
@@ -246,10 +246,11 @@ end
 -- ----------------------------------------------------------------------------
 -- Formules, hyperliens et styles d'écriture
 -- ----------------------------------------------------------------------------
-local FORMULA_MT, HYPERLINK_MT, STYLE_MT = {}, {}, {}
+local FORMULA_MT, HYPERLINK_MT, STYLE_MT, RICH_TEXT_MT = {}, {}, {}, {}
 local FORMULA_DATA = setmetatable({}, { __mode = "k" })
 local HYPERLINK_DATA = setmetatable({}, { __mode = "k" })
 local STYLE_DATA = setmetatable({}, { __mode = "k" })
+local RICH_TEXT_DATA = setmetatable({}, { __mode = "k" })
 
 local function copy_border(border)
   if not border then return nil end
@@ -285,6 +286,20 @@ STYLE_MT.__index = function(self, key)
 end
 STYLE_MT.__newindex = function()
   error("xlsx: un style est immuable", 2)
+end
+
+RICH_TEXT_MT.__index = function(self, key)
+  local data = RICH_TEXT_DATA[self]
+  if not data then return nil end
+  if key == "runs" then
+    local out = {}
+    for i, run in ipairs(data.runs) do local copy = {}; for k, v in pairs(run) do copy[k] = v end; out[i] = copy end
+    return out
+  end
+  return data[key]
+end
+RICH_TEXT_MT.__newindex = function()
+  error("xlsx: un texte enrichi est immuable", 2)
 end
 
 local function validate_cached_value(value, level)
@@ -442,7 +457,7 @@ local function normalize_style(opts, level)
   local allowed = {
     bold=true, italic=true, underline=true, strike=true,
     font_name=true, font_size=true, font_color=true, fill_color=true,
-    horizontal=true, vertical=true, wrap_text=true, number_format=true, border=true,
+    horizontal=true, vertical=true, wrap_text=true, number_format=true, border=true, locked=true, hidden=true,
   }
   for k in pairs(opts) do
     if not allowed[k] then error("xlsx: option de style inconnue : " .. tostring(k), level or 3) end
@@ -450,10 +465,13 @@ local function normalize_style(opts, level)
   local out = {}
   for _, key in ipairs({ "bold", "italic", "strike", "wrap_text" }) do
     local value = opts[key]
-    if value ~= nil and type(value) ~= "boolean" then
-      error("xlsx: " .. key .. " doit être un booléen", level or 3)
-    end
+    if value ~= nil and type(value) ~= "boolean" then error("xlsx: " .. key .. " doit être un booléen", level or 3) end
     out[key] = value == true
+  end
+  for _, key in ipairs({ "locked", "hidden" }) do
+    local value = opts[key]
+    if value ~= nil and type(value) ~= "boolean" then error("xlsx: " .. key .. " doit être un booléen", level or 3) end
+    out[key] = value
   end
   if opts.underline ~= nil then
     if type(opts.underline) ~= "string" or
@@ -518,7 +536,7 @@ local function copy_style_data(data)
     font_color = data.font_color, fill_color = data.fill_color,
     horizontal = data.horizontal, vertical = data.vertical,
     wrap_text = data.wrap_text == true, number_format = data.number_format,
-    border = copy_border(data.border),
+    locked = data.locked, hidden = data.hidden, border = copy_border(data.border),
   }
 end
 
@@ -526,6 +544,55 @@ local function style_object_from_data(data)
   local obj = setmetatable({}, STYLE_MT)
   STYLE_DATA[obj] = copy_style_data(data)
   return obj
+end
+
+local function copy_rich_runs(runs)
+  local out = {}
+  for i, run in ipairs(runs or {}) do out[i] = shallow_copy(run) end
+  return out
+end
+
+local function normalize_rich_text(runs, level)
+  local n = dense_array(runs, "segments de texte enrichi", level or 3)
+  if n < 1 or n > 255 then error("xlsx: un texte enrichi doit contenir entre 1 et 255 segments", level or 3) end
+  local out, plain = {}, {}
+  for i, src in ipairs(runs) do
+    if type(src) ~= "table" then error("xlsx: chaque segment enrichi doit être une table", level or 3) end
+    local allowed = { text=true, bold=true, italic=true, underline=true, strike=true,
+      font_name=true, font_size=true, font_color=true }
+    for k in pairs(src) do if not allowed[k] then error("xlsx: option de segment enrichi inconnue : " .. tostring(k), level or 3) end end
+    if type(src.text) ~= "string" or src.text == "" then error("xlsx: chaque segment enrichi exige text non vide", level or 3) end
+    validate_xml_text(src.text, "segment enrichi", level or 3)
+    local style = normalize_style({
+      bold=src.bold, italic=src.italic, underline=src.underline, strike=src.strike,
+      font_name=src.font_name, font_size=src.font_size, font_color=src.font_color,
+    }, level or 3)
+    out[i] = {
+      text=src.text, bold=style.bold, italic=style.italic, underline=style.underline,
+      strike=style.strike, font_name=style.font_name, font_size=style.font_size,
+      font_color=style.font_color,
+    }
+    plain[#plain + 1] = src.text
+  end
+  return { runs=out, text=table.concat(plain) }
+end
+
+--- Crée un texte enrichi immuable, utilisable avec write().
+function xlsx.rich_text(runs)
+  local data = normalize_rich_text(runs, 3)
+  local obj = setmetatable({}, RICH_TEXT_MT)
+  RICH_TEXT_DATA[obj] = data
+  return obj
+end
+
+function xlsx.is_rich_text(value)
+  return getmetatable(value) == RICH_TEXT_MT and RICH_TEXT_DATA[value] ~= nil
+end
+
+--- Renvoie une copie des segments d'un texte enrichi.
+function xlsx.rich_text_runs(value)
+  if not xlsx.is_rich_text(value) then error("xlsx: rich_text_runs attend un texte enrichi xlsx", 2) end
+  return copy_rich_runs(RICH_TEXT_DATA[value].runs)
 end
 
 --- Crée un style réutilisable et immuable.
@@ -574,7 +641,7 @@ local function style_key(data)
     key_part(data.font_color), key_part(data.fill_color),
     key_part(data.horizontal), key_part(data.vertical),
     data.wrap_text and "1" or "0", key_part(data.number_format),
-    key_part(border_key(data.border)),
+    key_part(data.locked), key_part(data.hidden), key_part(border_key(data.border)),
   }, "|")
 end
 
@@ -592,7 +659,7 @@ local function new_style_registry()
     dxfs = {}, dxf_map = {},
   }
   reg.font_map[table.concat({"0","0",key_part(nil),"0",key_part("Calibri"),key_part(11),key_part(nil)}, "|")] = 0
-  reg.xf_map[style_key({ bold=false, italic=false, strike=false, wrap_text=false })] = 0
+  reg.xf_map[style_key({ bold=false, italic=false, strike=false, wrap_text=false, locked=nil, hidden=nil })] = 0
   return reg
 end
 
@@ -659,6 +726,7 @@ local function register_style(reg, data)
   reg.xfs[#reg.xfs + 1] = {
     fontId=fontId, fillId=fillId, borderId=borderId, numFmtId=numFmtId,
     horizontal=data.horizontal, vertical=data.vertical, wrap_text=data.wrap_text,
+    locked=data.locked, hidden=data.hidden,
   }
   reg.xf_map[key] = id
   return id
@@ -677,7 +745,7 @@ end
 local function effective_style_data(style, value)
   local source = style and STYLE_DATA[style] or nil
   local data = source and copy_style_data(source)
-    or { bold=false, italic=false, strike=false, wrap_text=false }
+    or { bold=false, italic=false, strike=false, wrap_text=false, locked=nil, hidden=nil }
   if getmetatable(value) == DATE_MT and not data.number_format then
     data.number_format = value.kind == "datetime"
       and NUMBER_FORMAT_ALIASES.datetime or NUMBER_FORMAT_ALIASES.date
@@ -750,13 +818,25 @@ local function build_styles_xml(reg)
     if xf.fillId ~= 0 then attrs[#attrs + 1] = 'applyFill="1"' end
     if xf.borderId ~= 0 then attrs[#attrs + 1] = 'applyBorder="1"' end
     local has_alignment = xf.horizontal or xf.vertical or xf.wrap_text
+    local has_protection = xf.locked ~= nil or xf.hidden ~= nil
     if has_alignment then attrs[#attrs + 1] = 'applyAlignment="1"' end
-    if has_alignment then
-      b[#b + 1] = '<xf ' .. table.concat(attrs, " ") .. '><alignment'
-      if xf.horizontal then b[#b + 1] = ' horizontal="' .. xf.horizontal .. '"' end
-      if xf.vertical then b[#b + 1] = ' vertical="' .. xf.vertical .. '"' end
-      if xf.wrap_text then b[#b + 1] = ' wrapText="1"' end
-      b[#b + 1] = '/></xf>'
+    if has_protection then attrs[#attrs + 1] = 'applyProtection="1"' end
+    if has_alignment or has_protection then
+      b[#b + 1] = '<xf ' .. table.concat(attrs, " ") .. '>'
+      if has_alignment then
+        b[#b + 1] = '<alignment'
+        if xf.horizontal then b[#b + 1] = ' horizontal="' .. xf.horizontal .. '"' end
+        if xf.vertical then b[#b + 1] = ' vertical="' .. xf.vertical .. '"' end
+        if xf.wrap_text then b[#b + 1] = ' wrapText="1"' end
+        b[#b + 1] = '/>'
+      end
+      if has_protection then
+        b[#b + 1] = '<protection'
+        if xf.locked ~= nil then b[#b + 1] = ' locked="' .. (xf.locked and '1' or '0') .. '"' end
+        if xf.hidden ~= nil then b[#b + 1] = ' hidden="' .. (xf.hidden and '1' or '0') .. '"' end
+        b[#b + 1] = '/>'
+      end
+      b[#b + 1] = '</xf>'
     else
       b[#b + 1] = '<xf ' .. table.concat(attrs, " ") .. '/>'
     end
@@ -888,7 +968,11 @@ local function new_sheet(name, workbook)
     comments = {},
     images = {},
     charts = {},
+    sparklines = {},
     tables = {},
+    sheet_protection = nil,
+    row_page_breaks = {},
+    column_page_breaks = {},
     page_margins = nil,
     page_setup = nil,
     print_options = nil,
@@ -929,7 +1013,7 @@ function Sheet:write(row, col, value, style)
     mt = nil
     set_hyperlink_data(self, row, col, link)
   end
-  if mt == DATE_MT or mt == FORMULA_MT then
+  if mt == DATE_MT or mt == FORMULA_MT or mt == RICH_TEXT_MT then
     -- valeur taggée : acceptée telle quelle
   elseif value ~= nil and t ~= "string" and t ~= "number" and t ~= "boolean" then
     error("xlsx: type de cellule non supporté : " .. t, 2)
@@ -949,6 +1033,11 @@ function Sheet:write(row, col, value, style)
   end
   if value ~= nil or style ~= nil then ensure_cell_extent(self, row, col) end
   return self
+end
+
+--- Écrit un texte enrichi dans une cellule.
+function Sheet:write_rich_text(row, col, runs, style)
+  return self:write(row, col, xlsx.rich_text(runs), style)
 end
 
 --- Applique ou retire le style d'une cellule, y compris une cellule vide.
@@ -1189,7 +1278,11 @@ function Sheet:remove_image(index)
   table.remove(self.images, index); return self
 end
 
-local CHART_TYPES = { line=true, column=true, bar=true }
+local CHART_TYPES = { line=true, column=true, bar=true, pie=true, doughnut=true, area=true, scatter=true }
+local CHART_GROUPINGS = { standard="standard", stacked="stacked", percent_stacked="percentStacked" }
+local LEGEND_POSITIONS = { right="r", left="l", top="t", bottom="b", top_right="tr" }
+local LEGEND_POSITIONS_FROM_XML = {}; for k,v in pairs(LEGEND_POSITIONS) do LEGEND_POSITIONS_FROM_XML[v]=k end
+local MARKERS = { none=true, circle=true, dash=true, diamond=true, dot=true, picture=true, plus=true, square=true, star=true, triangle=true, x=true }
 local function absolute_a1_range(ref, what, level)
   local r1, c1, r2, c2 = parse_a1_range(ref, what, true, level or 3)
   return "$" .. col_ref(c1) .. "$" .. (r1 + 1) .. ":$" .. col_ref(c2) .. "$" .. (r2 + 1)
@@ -1200,35 +1293,74 @@ end
 local function chart_formula(sheet, ref, what, level)
   return quote_sheet_name(sheet.name) .. "!" .. absolute_a1_range(ref, what, level or 3)
 end
+local function normalize_axis(opts, what, level)
+  if opts==nil then return {} end
+  if type(opts)~="table" then error("xlsx: "..what.." doit être une table",level or 3) end
+  local allowed={title=true,min=true,max=true,number_format=true,major_gridlines=true}
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option d'axe inconnue : "..tostring(k),level or 3) end end
+  local out={ title=validate_optional_text(opts.title,what..".title",1000,level or 3) }
+  for _,key in ipairs({"min","max"}) do if opts[key]~=nil then check_finite_number(opts[key],what.."."..key,-1e307,1e307,level or 3); out[key]=opts[key] end end
+  if out.min and out.max and out.min>=out.max then error("xlsx: le minimum d'axe doit être inférieur au maximum",level or 3) end
+  if opts.number_format~=nil then out.number_format=validate_optional_text(opts.number_format,what..".number_format",255,level or 3) end
+  if opts.major_gridlines~=nil and type(opts.major_gridlines)~="boolean" then error("xlsx: major_gridlines doit être un booléen",level or 3) end
+  out.major_gridlines=opts.major_gridlines~=false
+  return out
+end
+local function normalize_data_labels(opts, level)
+  if opts==nil or opts==false then return nil end
+  if opts==true then return {show_value=true} end
+  if type(opts)~="table" then error("xlsx: data_labels doit être un booléen ou une table",level or 3) end
+  local allowed={show_value=true,show_percent=true,show_category=true,show_series_name=true,position=true}
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option d'étiquette inconnue : "..tostring(k),level or 3) end end
+  local out={}
+  for _,key in ipairs({"show_value","show_percent","show_category","show_series_name"}) do if opts[key]~=nil and type(opts[key])~="boolean" then error("xlsx: "..key.." doit être un booléen",level or 3) end; out[key]=opts[key]==true end
+  local positions={center="ctr",inside_end="inEnd",inside_base="inBase",outside_end="outEnd",best_fit="bestFit",left="l",right="r",top="t",bottom="b"}
+  if opts.position~=nil then if not positions[opts.position] then error("xlsx: position d'étiquette inconnue",level or 3) end; out.position=positions[opts.position] end
+  return out
+end
 local function normalize_chart(opts, sheet, level)
   if type(opts) ~= "table" then error("xlsx: add_chart attend une table d'options", level or 3) end
-  local allowed = { type=true, title=true, categories=true, series=true, row=true, col=true, width=true, height=true, legend=true }
+  local allowed = { type=true, title=true, categories=true, x_values=true, series=true, row=true, col=true, width=true, height=true,
+    legend=true, legend_position=true, grouping=true, x_axis=true, y_axis=true, hole_size=true, data_labels=true }
   for k in pairs(opts) do if not allowed[k] then error("xlsx: option de graphique inconnue : " .. tostring(k), level or 3) end end
   local kind = opts.type or "column"
-  if not CHART_TYPES[kind] then error("xlsx: type de graphique doit valoir line, column ou bar", level or 3) end
+  if not CHART_TYPES[kind] then error("xlsx: type de graphique inconnu", level or 3) end
   local row, col = opts.row or 0, opts.col or 0
   check_index(row, "row", level or 3); check_index(col, "col", level or 3)
   local width, height = opts.width or 640, opts.height or 360
   check_finite_number(width, "largeur de graphique", 100, 2000, level or 3)
   check_finite_number(height, "hauteur de graphique", 100, 2000, level or 3)
   local title = validate_optional_text(opts.title, "titre de graphique", 1000, level or 3)
-  local categories = chart_formula(sheet, opts.categories, "catégories du graphique", level or 3)
+  local categories = kind~="scatter" and chart_formula(sheet, opts.categories, "catégories du graphique", level or 3) or nil
+  local default_x = kind=="scatter" and chart_formula(sheet, opts.x_values, "valeurs X", level or 3) or nil
   local n = dense_array(opts.series, "séries du graphique", level or 3)
   if n < 1 or n > 255 then error("xlsx: un graphique doit contenir entre 1 et 255 séries", level or 3) end
+  if (kind=="pie" or kind=="doughnut") and n~=1 then error("xlsx: un graphique pie/doughnut exige exactement une série",level or 3) end
   local series = {}
   for i, src in ipairs(opts.series) do
     if type(src) ~= "table" then error("xlsx: chaque série doit être une table", level or 3) end
-    for k in pairs(src) do if k ~= "name" and k ~= "name_ref" and k ~= "values" then error("xlsx: option de série inconnue : " .. tostring(k), level or 3) end end
+    local allowed_series={name=true,name_ref=true,values=true,x_values=true,color=true,marker=true,line_width=true,smooth=true}
+    for k in pairs(src) do if not allowed_series[k] then error("xlsx: option de série inconnue : " .. tostring(k), level or 3) end end
     if src.name ~= nil and src.name_ref ~= nil then error("xlsx: une série ne peut pas avoir name et name_ref", level or 3) end
     local item = { values=chart_formula(sheet, src.values, "valeurs de série", level or 3) }
+    if kind=="scatter" then item.x_values=src.x_values and chart_formula(sheet,src.x_values,"valeurs X de série",level or 3) or default_x; if not item.x_values then error("xlsx: scatter exige x_values",level or 3) end end
     if src.name ~= nil then item.name = validate_optional_text(src.name, "nom de série", 255, level or 3) end
     if src.name_ref ~= nil then item.name_ref = chart_formula(sheet, src.name_ref, "nom de série", level or 3) end
+    item.color=normalize_color(src.color,"couleur de série",level or 3)
+    if src.marker~=nil then if type(src.marker)~="string" or not MARKERS[src.marker] then error("xlsx: marqueur de série inconnu",level or 3) end; item.marker=src.marker end
+    if src.line_width~=nil then check_finite_number(src.line_width,"épaisseur de ligne",0.25,20,level or 3); item.line_width=src.line_width end
+    if src.smooth~=nil and type(src.smooth)~="boolean" then error("xlsx: smooth doit être un booléen",level or 3) end; item.smooth=src.smooth==true
     series[i] = item
   end
   if opts.legend ~= nil and type(opts.legend) ~= "boolean" then error("xlsx: legend doit être un booléen", level or 3) end
-  return { type=kind, title=title, categories=categories, series=series, row=row, col=col, width=width, height=height, legend=opts.legend ~= false }
+  local legend_position=opts.legend_position or "right"; if not LEGEND_POSITIONS[legend_position] then error("xlsx: position de légende inconnue",level or 3) end
+  local grouping=opts.grouping or "standard"; if not CHART_GROUPINGS[grouping] then error("xlsx: grouping doit valoir standard, stacked ou percent_stacked",level or 3) end
+  if (kind=="pie" or kind=="doughnut" or kind=="scatter") and opts.grouping~=nil then error("xlsx: grouping n'est pas applicable à ce type de graphique",level or 3) end
+  local hole_size=opts.hole_size or 50; if kind=="doughnut" then check_finite_number(hole_size,"taille du trou",10,90,level or 3) elseif opts.hole_size~=nil then error("xlsx: hole_size est réservé aux graphiques doughnut",level or 3) end
+  return { type=kind, title=title, categories=categories, series=series, row=row, col=col, width=width, height=height,
+    legend=opts.legend ~= false, legend_position=legend_position, grouping=grouping, x_axis=normalize_axis(opts.x_axis,"x_axis",level),
+    y_axis=normalize_axis(opts.y_axis,"y_axis",level), hole_size=hole_size, data_labels=normalize_data_labels(opts.data_labels,level) }
 end
-
 --- Ajoute un graphique line, column ou bar.
 function Sheet:add_chart(opts)
   self.charts[#self.charts + 1] = normalize_chart(opts, self, 3)
@@ -1283,6 +1415,91 @@ function Sheet:remove_table(name)
   name = validate_table_name(name, 3)
   for i, item in ipairs(self.tables) do if item.name:lower() == name:lower() then table.remove(self.tables, i); return self end end
   return self
+end
+
+local function legacy_password_hash(password, level)
+  if password == nil then return nil end
+  if type(password) ~= "string" then error("xlsx: password doit être une string", level or 3) end
+  validate_xml_text(password, "mot de passe", level or 3)
+  if #password > 15 then error("xlsx: la protection classique accepte au maximum 15 octets", level or 3) end
+  local hash = 0
+  for i = 1, #password do
+    local value = password:byte(i) << i
+    local rotated = value >> 15
+    value = value & 0x7fff
+    hash = hash ~ (value | rotated)
+  end
+  hash = hash ~ #password ~ 0xCE4B
+  return string.format("%X", hash & 0xFFFF)
+end
+
+local SHEET_PROTECTION_OPTIONS = {
+  select_locked_cells=true, select_unlocked_cells=true, format_cells=true,
+  format_columns=true, format_rows=true, insert_columns=true, insert_rows=true,
+  insert_hyperlinks=true, delete_columns=true, delete_rows=true, sort=true,
+  auto_filter=true, pivot_tables=true, objects=true, scenarios=true,
+}
+
+--- Protège ou déprotège une feuille. La protection XLSX n'est pas un chiffrement.
+function Sheet:protect(opts)
+  if opts == false then self.sheet_protection = nil; return self end
+  opts = opts or {}; if type(opts) ~= "table" then error("xlsx: protect attend une table", 2) end
+  for k in pairs(opts) do if k ~= "password" and not SHEET_PROTECTION_OPTIONS[k] then error("xlsx: option de protection inconnue : " .. tostring(k), 2) end end
+  local out = { password_hash=legacy_password_hash(opts.password, 3) }
+  for key in pairs(SHEET_PROTECTION_OPTIONS) do
+    if opts[key] ~= nil and type(opts[key]) ~= "boolean" then error("xlsx: " .. key .. " doit être un booléen", 2) end
+    out[key] = opts[key] == true
+  end
+  self.sheet_protection = out
+  return self
+end
+
+function Sheet:get_protection()
+  return self.sheet_protection and shallow_copy(self.sheet_protection) or nil
+end
+
+local function add_page_break(list, value, max, what, level)
+  if math.type(value) ~= "integer" or value < 1 or value > max then error("xlsx: " .. what .. " doit être un entier entre 1 et " .. max, level or 3) end
+  for _, current in ipairs(list) do if current == value then return end end
+  list[#list + 1] = value; table.sort(list)
+end
+function Sheet:add_row_page_break(row) add_page_break(self.row_page_breaks, row, MAX_ROW, "saut de ligne", 3); return self end
+function Sheet:add_column_page_break(col)
+  if type(col) == "string" then col = col_number(col); if col ~= nil then col = col + 1 end end
+  add_page_break(self.column_page_breaks, col, MAX_COL, "saut de colonne", 3); return self
+end
+function Sheet:clear_page_breaks() self.row_page_breaks = {}; self.column_page_breaks = {}; return self end
+function Sheet:get_row_page_breaks() return { table.unpack(self.row_page_breaks) } end
+function Sheet:get_column_page_breaks() return { table.unpack(self.column_page_breaks) } end
+
+local SPARKLINE_TYPES = { line="line", column="column", win_loss="stacked" }
+local function normalize_sparkline(sheet, target, source, opts, level)
+  local _,_,_,_,target_ref=parse_a1_range(target,"cellule de sparkline",true,level or 3)
+  if target_ref:match(":") and target_ref:match("^([^:]+):%1$") then target_ref=target_ref:match("^([^:]+)") end
+  local tr1,tc1,tr2,tc2=parse_a1_range(target,"cellule de sparkline",true,level or 3)
+  if tr1~=tr2 or tc1~=tc2 then error("xlsx: une sparkline exige une seule cellule cible",level or 3) end
+  local _,_,_,_,source_ref=parse_a1_range(source,"source de sparkline",false,level or 3)
+  opts=opts or {}; if type(opts)~="table" then error("xlsx: options de sparkline invalides",level or 3) end
+  local allowed={type=true,color=true,negative_color=true,high_color=true,low_color=true,first_color=true,last_color=true,
+    show_markers=true,show_high=true,show_low=true,show_first=true,show_last=true,show_negative=true,right_to_left=true}
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option de sparkline inconnue : "..tostring(k),level or 3) end end
+  local kind=opts.type or "line"; if not SPARKLINE_TYPES[kind] then error("xlsx: type de sparkline doit valoir line, column ou win_loss",level or 3) end
+  local out={target=col_ref(tc1)..(tr1+1), source=quote_sheet_name(sheet.name).."!"..absolute_a1_range(source_ref,"source de sparkline",level or 3), type=kind}
+  for _,key in ipairs({"color","negative_color","high_color","low_color","first_color","last_color"}) do out[key]=normalize_color(opts[key],key,level or 3) end
+  for _,key in ipairs({"show_markers","show_high","show_low","show_first","show_last","show_negative","right_to_left"}) do
+    if opts[key]~=nil and type(opts[key])~="boolean" then error("xlsx: "..key.." doit être un booléen",level or 3) end
+    out[key]=opts[key]==true
+  end
+  return out
+end
+function Sheet:add_sparkline(target, source, opts) self.sparklines[#self.sparklines+1]=normalize_sparkline(self,target,source,opts,3); return self end
+function Sheet:remove_sparkline(target)
+  local r,c=parse_a1_range(target,"cellule de sparkline",true,3); local ref=col_ref(c)..(r+1)
+  for i=#self.sparklines,1,-1 do if self.sparklines[i].target==ref then table.remove(self.sparklines,i) end end
+  return self
+end
+function Sheet:get_sparklines()
+  local out={}; for i,v in ipairs(self.sparklines) do out[i]=shallow_copy(v) end; return out
 end
 
 local PAPER_SIZES = { letter=1, legal=5, a4=9, a3=8, a5=11 }
@@ -1492,6 +1709,8 @@ local CF_OPERATORS = VALIDATION_OPERATORS
 local CF_TYPE_TO_XML = {
   cell="cellIs", contains_text="containsText", blanks="containsBlanks",
   not_blanks="notContainsBlanks", duplicate="duplicateValues", custom="expression",
+  color_scale="colorScale", data_bar="dataBar", icon_set="iconSet",
+  top="top10", bottom="top10", above_average="aboveAverage", below_average="aboveAverage",
 }
 local CF_TYPE_FROM_XML = {}
 for k, v in pairs(CF_TYPE_TO_XML) do CF_TYPE_FROM_XML[v] = k end
@@ -1504,22 +1723,92 @@ local function excel_quote(text)
   return '"' .. text:gsub('"', '""') .. '"'
 end
 
+local CFVO_TYPES = { min=true, max=true, number=true, percent=true, percentile=true, formula=true }
+local CFVO_TO_XML = { min="min", max="max", number="num", percent="percent", percentile="percentile", formula="formula" }
+local CFVO_FROM_XML = { min="min", max="max", num="number", percent="percent", percentile="percentile", formula="formula" }
+local ICON_SETS = {
+  ["3_arrows"]="3Arrows", ["3_arrows_gray"]="3ArrowsGray", ["3_flags"]="3Flags",
+  ["3_traffic_lights"]="3TrafficLights1", ["3_traffic_lights_rimmed"]="3TrafficLights2",
+  ["3_signs"]="3Signs", ["3_symbols"]="3Symbols", ["3_symbols_circled"]="3Symbols2",
+  ["4_arrows"]="4Arrows", ["4_arrows_gray"]="4ArrowsGray", ["4_ratings"]="4Rating",
+  ["4_traffic_lights"]="4TrafficLights", ["5_arrows"]="5Arrows", ["5_arrows_gray"]="5ArrowsGray",
+  ["5_ratings"]="5Rating", ["5_quarters"]="5Quarters",
+}
+local ICON_SETS_FROM_XML = {}; for k,v in pairs(ICON_SETS) do ICON_SETS_FROM_XML[v]=k end
+local function normalize_cfvo(kind, value, what, level)
+  kind=kind or what
+  if not CFVO_TYPES[kind] then error("xlsx: type de seuil conditionnel inconnu : "..tostring(kind),level or 3) end
+  if kind=="min" or kind=="max" then
+    if value~=nil then error("xlsx: un seuil min/max ne doit pas avoir de valeur",level or 3) end
+    return {type=kind}
+  end
+  if value==nil then error("xlsx: le seuil "..what.." exige une valeur",level or 3) end
+  if kind=="formula" then value=validation_operand(value,"formule de seuil",level); if type(value)~="string" then error("xlsx: une formule de seuil doit être une string",level or 3) end
+  elseif type(value)~="number" or value~=value or value==math.huge or value==-math.huge then error("xlsx: valeur de seuil invalide",level or 3) end
+  return {type=kind,value=value}
+end
+
 local function normalize_conditional_format(ref, opts, level)
   local _, _, _, _, normalized = parse_a1_range(ref, "plage conditionnelle", true, level or 3)
   if type(opts) ~= "table" then error("xlsx: les options conditionnelles doivent être une table", level or 3) end
   local allowed = { type=true, operator=true, value=true, minimum=true, maximum=true, formula=true,
-    text=true, style=true, stop_if_true=true }
+    text=true, style=true, stop_if_true=true,
+    min_type=true,min_value=true,min_color=true,mid_type=true,mid_value=true,mid_color=true,max_type=true,max_value=true,max_color=true,
+    start_type=true,start_value=true,end_type=true,end_value=true,color=true,show_value=true,
+    icons=true,value_type=true,values=true,reverse=true,rank=true,percent=true,
+  }
   for k in pairs(opts) do if not allowed[k] then error("xlsx: option conditionnelle inconnue : " .. tostring(k), level or 3) end end
   local kind = opts.type
   if type(kind) ~= "string" or not CF_TYPE_TO_XML[kind] then error("xlsx: type conditionnel inconnu", level or 3) end
-  local style_data = require_style(opts.style, level or 3)
-  if not style_data then error("xlsx: un format conditionnel exige style", level or 3) end
-  if style_data.number_format or style_data.horizontal or style_data.vertical or style_data.wrap_text then
-    error("xlsx: les formats conditionnels acceptent police, fond et bordures, pas number_format/alignment", level or 3)
-  end
   if opts.stop_if_true ~= nil and type(opts.stop_if_true) ~= "boolean" then error("xlsx: stop_if_true doit être un booléen", level or 3) end
-  local out = { ref=normalized, type=kind, style=opts.style, stop_if_true=opts.stop_if_true == true }
+  local out = { ref=normalized, type=kind, stop_if_true=opts.stop_if_true == true }
   local first = top_left_ref(normalized)
+  if kind=="color_scale" then
+    if opts.style~=nil then error("xlsx: color_scale n'accepte pas style",level or 3) end
+    out.min=normalize_cfvo(opts.min_type or "min",opts.min_value,"minimum",level)
+    out.max=normalize_cfvo(opts.max_type or "max",opts.max_value,"maximum",level)
+    out.min_color=normalize_color(opts.min_color or "F8696B","min_color",level)
+    out.max_color=normalize_color(opts.max_color or "63BE7B","max_color",level)
+    if opts.mid_type~=nil or opts.mid_value~=nil or opts.mid_color~=nil then
+      out.mid=normalize_cfvo(opts.mid_type or "percentile",opts.mid_value==nil and 50 or opts.mid_value,"milieu",level)
+      out.mid_color=normalize_color(opts.mid_color or "FFEB84","mid_color",level)
+    end
+    return out
+  elseif kind=="data_bar" then
+    if opts.style~=nil then error("xlsx: data_bar n'accepte pas style",level or 3) end
+    out.start=normalize_cfvo(opts.start_type or "min",opts.start_value,"début",level)
+    out.finish=normalize_cfvo(opts.end_type or "max",opts.end_value,"fin",level)
+    out.color=normalize_color(opts.color or "5B9BD5","couleur de barre",level)
+    if opts.show_value~=nil and type(opts.show_value)~="boolean" then error("xlsx: show_value doit être un booléen",level or 3) end
+    out.show_value=opts.show_value~=false
+    return out
+  elseif kind=="icon_set" then
+    if opts.style~=nil then error("xlsx: icon_set n'accepte pas style",level or 3) end
+    local icon=opts.icons or "3_traffic_lights"; if not ICON_SETS[icon] then error("xlsx: jeu d'icônes inconnu",level or 3) end
+    local count=tonumber(icon:match("^(%d)")); local values=opts.values or {}; dense_array(values,"seuils d'icônes",level)
+    if #values~=count then error("xlsx: le jeu d'icônes exige "..count.." seuils",level or 3) end
+    local value_type=opts.value_type or "percent"; if not CFVO_TYPES[value_type] or value_type=="min" or value_type=="max" then error("xlsx: value_type d'icônes invalide",level or 3) end
+    out.icons=icon; out.thresholds={}; for i,v in ipairs(values) do out.thresholds[i]=normalize_cfvo(value_type,v,"icône",level) end
+    for _,key in ipairs({"show_value","reverse"}) do if opts[key]~=nil and type(opts[key])~="boolean" then error("xlsx: "..key.." doit être un booléen",level or 3) end end
+    out.show_value=opts.show_value~=false; out.reverse=opts.reverse==true
+    return out
+  elseif kind=="top" or kind=="bottom" then
+    if opts.style==nil then error("xlsx: top/bottom exige style",level or 3) end
+    out.rank=opts.rank or 10; if math.type(out.rank)~="integer" or out.rank<1 or out.rank>1000 then error("xlsx: rank doit être un entier 1..1000",level or 3) end
+    if opts.percent~=nil and type(opts.percent)~="boolean" then error("xlsx: percent doit être un booléen",level or 3) end
+    out.percent=opts.percent==true; out.bottom=kind=="bottom"
+  elseif kind=="above_average" or kind=="below_average" then
+    if opts.style==nil then error("xlsx: above_average/below_average exige style",level or 3) end
+    out.above_average=kind=="above_average"
+  end
+  if kind~="color_scale" and kind~="data_bar" and kind~="icon_set" then
+    local style_data = require_style(opts.style, level or 3)
+    if not style_data then error("xlsx: un format conditionnel exige style", level or 3) end
+    if style_data.number_format or style_data.horizontal or style_data.vertical or style_data.wrap_text or style_data.locked~=nil or style_data.hidden~=nil then
+      error("xlsx: les formats conditionnels acceptent police, fond et bordures uniquement", level or 3)
+    end
+    out.style=opts.style
+  end
   if kind == "cell" then
     local op = opts.operator
     if not CF_OPERATORS[op] then error("xlsx: opérateur conditionnel inconnu", level or 3) end
@@ -1537,17 +1826,14 @@ local function normalize_conditional_format(ref, opts, level)
     if not text or text == "" then error("xlsx: contains_text exige text", level or 3) end
     out.text = text
     out.formula1 = 'NOT(ISERROR(SEARCH(' .. excel_quote(text) .. ',' .. first .. ')))'
-  elseif kind == "blanks" then
-    out.formula1 = 'LEN(TRIM(' .. first .. '))=0'
-  elseif kind == "not_blanks" then
-    out.formula1 = 'LEN(TRIM(' .. first .. '))>0'
+  elseif kind == "blanks" then out.formula1 = 'LEN(TRIM(' .. first .. '))=0'
+  elseif kind == "not_blanks" then out.formula1 = 'LEN(TRIM(' .. first .. '))>0'
   elseif kind == "custom" then
     out.formula1 = validation_operand(opts.formula, "formule conditionnelle", level)
     if type(out.formula1) ~= "string" then error("xlsx: custom exige formula string", level or 3) end
   end
   return out
 end
-
 function Sheet:add_conditional_format(ref, opts)
   self.conditional_formats[#self.conditional_formats + 1] = normalize_conditional_format(ref, opts, 3)
   return self
@@ -1562,7 +1848,11 @@ function Sheet:remove_conditional_format(ref)
 end
 
 local function copy_conditional_format(v)
-  return shallow_copy(v)
+  local out=shallow_copy(v)
+  if v.min then out.min=shallow_copy(v.min) end; if v.mid then out.mid=shallow_copy(v.mid) end; if v.max then out.max=shallow_copy(v.max) end
+  if v.start then out.start=shallow_copy(v.start) end; if v.finish then out.finish=shallow_copy(v.finish) end
+  if v.thresholds then out.thresholds={}; for i,x in ipairs(v.thresholds) do out.thresholds[i]=shallow_copy(x) end end
+  return out
 end
 
 function Sheet:get_conditional_formats()
@@ -1805,6 +2095,10 @@ function Sheet:_xml(sst, sst_index)
             end
             b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. tattr .. '><f' .. fattrs .. '>' ..
               esc_xml(formula.expression, "formule", 0) .. '</f>' .. cached .. '</c>'
+          elseif mt == RICH_TEXT_MT then
+            local idx = sst_index[v]
+            if idx == nil then idx = #sst; sst[#sst + 1] = v; sst_index[v] = idx end
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. ' t="s"><v>' .. idx .. '</v></c>'
           elseif tv == "string" then
             local idx = sst_index[v]
             if idx == nil then idx = #sst; sst[#sst + 1] = v; sst_index[v] = idx end
@@ -1822,6 +2116,13 @@ function Sheet:_xml(sst, sst_index)
     end
   end
   b[#b + 1] = '</sheetData>'
+  if self.sheet_protection then
+    local p=self.sheet_protection; local attrs={'sheet="1"'}
+    if p.password_hash then attrs[#attrs+1]='password="'..p.password_hash..'"' end
+    local names={select_locked_cells="selectLockedCells",select_unlocked_cells="selectUnlockedCells",format_cells="formatCells",format_columns="formatColumns",format_rows="formatRows",insert_columns="insertColumns",insert_rows="insertRows",insert_hyperlinks="insertHyperlinks",delete_columns="deleteColumns",delete_rows="deleteRows",sort="sort",auto_filter="autoFilter",pivot_tables="pivotTables",objects="objects",scenarios="scenarios"}
+    for key,attr in pairs(names) do attrs[#attrs+1]=attr..'="'..(p[key] and '1' or '0')..'"' end
+    b[#b+1]='<sheetProtection '..table.concat(attrs,' ')..'/>'
+  end
   local filter_ref
   if self._auto_filter == true and self.maxrow >= 0 and self.maxcol >= 0 then
     filter_ref = 'A1:' .. col_ref(self.maxcol) .. (self.maxrow + 1)
@@ -1834,18 +2135,34 @@ function Sheet:_xml(sst, sst_index)
     for _, range in ipairs(self.merged_ranges) do b[#b + 1] = '<mergeCell ref="' .. range.ref .. '"/>' end
     b[#b + 1] = '</mergeCells>'
   end
+  local function cfvo_xml(item)
+    local attrs={'type="'..CFVO_TO_XML[item.type]..'"'}; if item.value~=nil then attrs[#attrs+1]='val="'..esc_xml(num2str(item.value),"seuil",0)..'"' end
+    return '<cfvo '..table.concat(attrs,' ')..'/>'
+  end
   for priority, rule in ipairs(self.conditional_formats) do
-    local dxf_id = self._workbook:_dxf_id(rule.style)
     local xml_type = CF_TYPE_TO_XML[rule.type]
-    local attrs = { 'type="' .. xml_type .. '"', 'priority="' .. priority .. '"', 'dxfId="' .. dxf_id .. '"' }
+    local attrs = { 'type="' .. xml_type .. '"', 'priority="' .. priority .. '"' }
+    if rule.style then attrs[#attrs+1]='dxfId="'..self._workbook:_dxf_id(rule.style)..'"' end
     if rule.stop_if_true then attrs[#attrs + 1] = 'stopIfTrue="1"' end
     if rule.operator then attrs[#attrs + 1] = 'operator="' .. CF_OPERATORS[rule.operator] .. '"' end
     if rule.text then attrs[#attrs + 1] = 'text="' .. esc_xml(rule.text, "texte conditionnel", 0) .. '"' end
+    if rule.type=="top" or rule.type=="bottom" then attrs[#attrs+1]='rank="'..rule.rank..'"'; if rule.percent then attrs[#attrs+1]='percent="1"' end; if rule.bottom then attrs[#attrs+1]='bottom="1"' end end
+    if rule.type=="above_average" or rule.type=="below_average" then attrs[#attrs+1]='aboveAverage="'..(rule.above_average and '1' or '0')..'"' end
     b[#b + 1] = '<conditionalFormatting sqref="' .. rule.ref .. '"><cfRule ' .. table.concat(attrs, " ") .. '>'
-    local f1 = validation_formula_xml(rule.formula1, self._workbook._date1904)
-    local f2 = validation_formula_xml(rule.formula2, self._workbook._date1904)
-    if f1 then b[#b + 1] = '<formula>' .. esc_xml(f1, "formule conditionnelle", 0) .. '</formula>' end
-    if f2 then b[#b + 1] = '<formula>' .. esc_xml(f2, "formule conditionnelle", 0) .. '</formula>' end
+    if rule.type=="color_scale" then
+      b[#b+1]='<colorScale>'..cfvo_xml(rule.min)..(rule.mid and cfvo_xml(rule.mid) or '')..cfvo_xml(rule.max)
+      b[#b+1]='<color rgb="'..rule.min_color..'"/>'..(rule.mid_color and '<color rgb="'..rule.mid_color..'"/>' or '')..'<color rgb="'..rule.max_color..'"/></colorScale>'
+    elseif rule.type=="data_bar" then
+      b[#b+1]='<dataBar showValue="'..(rule.show_value and '1' or '0')..'">'..cfvo_xml(rule.start)..cfvo_xml(rule.finish)..'<color rgb="'..rule.color..'"/></dataBar>'
+    elseif rule.type=="icon_set" then
+      b[#b+1]='<iconSet iconSet="'..ICON_SETS[rule.icons]..'" showValue="'..(rule.show_value and '1' or '0')..'" reverse="'..(rule.reverse and '1' or '0')..'">'
+      for _,threshold in ipairs(rule.thresholds) do b[#b+1]=cfvo_xml(threshold) end; b[#b+1]='</iconSet>'
+    else
+      local f1 = validation_formula_xml(rule.formula1, self._workbook._date1904)
+      local f2 = validation_formula_xml(rule.formula2, self._workbook._date1904)
+      if f1 then b[#b + 1] = '<formula>' .. esc_xml(f1, "formule conditionnelle", 0) .. '</formula>' end
+      if f2 then b[#b + 1] = '<formula>' .. esc_xml(f2, "formule conditionnelle", 0) .. '</formula>' end
+    end
     b[#b + 1] = '</cfRule></conditionalFormatting>'
   end
   if #self.data_validations > 0 then
@@ -1924,6 +2241,17 @@ function Sheet:_xml(sst, sst_index)
     b[#b+1]='</headerFooter>'
   end
 
+  if #self.row_page_breaks>0 then
+    b[#b+1]='<rowBreaks count="'..#self.row_page_breaks..'" manualBreakCount="'..#self.row_page_breaks..'">'
+    for _,id in ipairs(self.row_page_breaks) do b[#b+1]='<brk id="'..id..'" min="0" max="'..MAX_COL..'" man="1"/>' end
+    b[#b+1]='</rowBreaks>'
+  end
+  if #self.column_page_breaks>0 then
+    b[#b+1]='<colBreaks count="'..#self.column_page_breaks..'" manualBreakCount="'..#self.column_page_breaks..'">'
+    for _,id in ipairs(self.column_page_breaks) do b[#b+1]='<brk id="'..id..'" min="0" max="'..MAX_ROW..'" man="1"/>' end
+    b[#b+1]='</colBreaks>'
+  end
+
   local comments, vml = comments_xml(self)
   if comments then
     local comments_id = "rId" .. (#rels + 1)
@@ -1943,6 +2271,19 @@ function Sheet:_xml(sst, sst_index)
       b[#b+1]='<tablePart r:id="'..id..'"/>'
     end
     b[#b+1]='</tableParts>'
+  end
+  if #self.sparklines>0 then
+    b[#b+1]='<extLst><ext uri="{05C60535-1F16-4fd2-B633-F4F36F0B64E0}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:sparklineGroups xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">'
+    for _,sp in ipairs(self.sparklines) do
+      local attrs={'type="'..SPARKLINE_TYPES[sp.type]..'"'}
+      local flags={show_markers="markers",show_high="high",show_low="low",show_first="first",show_last="last",show_negative="negative",right_to_left="rightToLeft"}
+      for key,attr in pairs(flags) do if sp[key] then attrs[#attrs+1]=attr..'="1"' end end
+      b[#b+1]='<x14:sparklineGroup '..table.concat(attrs,' ')..'>'
+      local colors={color="colorSeries",negative_color="colorNegative",high_color="colorHigh",low_color="colorLow",first_color="colorFirst",last_color="colorLast"}
+      for key,tag in pairs(colors) do if sp[key] then b[#b+1]='<x14:'..tag..' rgb="'..sp[key]..'"/>' end end
+      b[#b+1]='<x14:sparklines><x14:sparkline><xm:f>'..esc_xml(sp.source,"source de sparkline",0)..'</xm:f><xm:sqref>'..sp.target..'</xm:sqref></x14:sparkline></x14:sparklines></x14:sparklineGroup>'
+    end
+    b[#b+1]='</x14:sparklineGroups></ext></extLst>'
   end
   b[#b + 1] = '</worksheet>'
   return table.concat(b), worksheet_relationships_xml(rels), comments, vml
@@ -1990,8 +2331,42 @@ function xlsx.new(opts)
   return setmetatable({
     sheets = {}, _date1904 = date_system == "1904", _sheet_names = {},
     _style_registry = nil, _active_sheet = 1, _defined_names = {}, _defined_name_map = {},
+    _workbook_protection = nil, _properties = {},
   }, Workbook)
 end
+
+--- Définit les propriétés principales et étendues du document.
+function Workbook:set_properties(opts)
+  if opts == false then self._properties = {}; return self end
+  opts = opts or {}; if type(opts) ~= "table" then error("xlsx: set_properties attend une table", 2) end
+  local allowed = { title=true, subject=true, creator=true, description=true, keywords=true, category=true, company=true, manager=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: propriété inconnue : " .. tostring(k), 2) end end
+  local out = {}
+  for _, key in ipairs({"title","subject","creator","description","category","company","manager"}) do
+    out[key] = validate_optional_text(opts[key], "propriété "..key, 4096, 3)
+  end
+  if opts.keywords ~= nil then
+    if type(opts.keywords) == "table" then
+      dense_array(opts.keywords,"mots-clés",3); local values={}
+      for i,v in ipairs(opts.keywords) do values[i]=validate_optional_text(v,"mot-clé",255,3) end
+      out.keywords=table.concat(values, ", ")
+    else out.keywords=validate_optional_text(opts.keywords,"mots-clés",4096,3) end
+  end
+  self._properties=out; return self
+end
+function Workbook:get_properties() return shallow_copy(self._properties) end
+
+--- Protège la structure du classeur sans chiffrer son contenu.
+function Workbook:protect(opts)
+  if opts == false then self._workbook_protection=nil; return self end
+  opts=opts or {}; if type(opts)~="table" then error("xlsx: protect attend une table",2) end
+  local allowed={password=true,structure=true,windows=true}
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option de protection du classeur inconnue : "..tostring(k),2) end end
+  for _,key in ipairs({"structure","windows"}) do if opts[key]~=nil and type(opts[key])~="boolean" then error("xlsx: "..key.." doit être un booléen",2) end end
+  self._workbook_protection={ password_hash=legacy_password_hash(opts.password,3), structure=opts.structure~=false, windows=opts.windows==true }
+  return self
+end
+function Workbook:get_protection() return self._workbook_protection and shallow_copy(self._workbook_protection) or nil end
 
 function Workbook:add_sheet(name)
   if name == nil then name = "Sheet" .. (#self.sheets + 1) end
@@ -2090,25 +2465,72 @@ local function chart_title_xml(title)
   if not title then return '<c:autoTitleDeleted val="1"/>' end
   return '<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="fr-FR"/><a:t>'..esc_xml(title,"titre de graphique",0)..'</a:t></a:r></a:p></c:rich></c:tx><c:layout/><c:overlay val="0"/></c:title>'
 end
+local function axis_title_xml(title)
+  return title and chart_title_xml(title) or ''
+end
+local function series_shape_xml(series, line_only)
+  if not series.color and not series.line_width then return '' end
+  local b={'<c:spPr>'}
+  if series.color and not line_only then b[#b+1]='<a:solidFill><a:srgbClr val="'..series.color:sub(-6)..'"/></a:solidFill>' end
+  b[#b+1]='<a:ln'..(series.line_width and (' w="'..math.floor(series.line_width*12700+0.5)..'"') or '')..'>'
+  if series.color then b[#b+1]='<a:solidFill><a:srgbClr val="'..series.color:sub(-6)..'"/></a:solidFill>' end
+  b[#b+1]='<a:prstDash val="solid"/></a:ln></c:spPr>'
+  return table.concat(b)
+end
+local function data_labels_xml(labels)
+  if not labels then return '' end
+  local b={'<c:dLbls>'}
+  if labels.position then b[#b+1]='<c:dLblPos val="'..labels.position..'"/>' end
+  b[#b+1]='<c:showLegendKey val="0"/><c:showVal val="'..(labels.show_value and '1' or '0')..'"/><c:showCatName val="'..(labels.show_category and '1' or '0')..'"/><c:showSerName val="'..(labels.show_series_name and '1' or '0')..'"/><c:showPercent val="'..(labels.show_percent and '1' or '0')..'"/>'
+  b[#b+1]='</c:dLbls>'; return table.concat(b)
+end
+local function chart_axis_xml(tag,id,cross,pos,axis,category)
+  local b={'<c:'..tag..'><c:axId val="'..id..'"/><c:scaling><c:orientation val="minMax"/>'}
+  if axis.min~=nil then b[#b+1]='<c:min val="'..num2str(axis.min)..'"/>' end; if axis.max~=nil then b[#b+1]='<c:max val="'..num2str(axis.max)..'"/>' end
+  b[#b+1]='</c:scaling><c:delete val="0"/><c:axPos val="'..pos..'"/>'
+  if axis.major_gridlines then b[#b+1]='<c:majorGridlines/>' end
+  if axis.title then b[#b+1]=axis_title_xml(axis.title) end
+  b[#b+1]='<c:numFmt formatCode="'..esc_xml(axis.number_format or 'General','format axe',0)..'" sourceLinked="'..(axis.number_format and '0' or '1')..'"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crossAx val="'..cross..'"/><c:crosses val="autoZero"/>'
+  if category then b[#b+1]='<c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/>' else b[#b+1]='<c:crossBetween val="between"/>' end
+  b[#b+1]='</c:'..tag..'>'; return table.concat(b)
+end
 local function chart_xml(chart, chart_id)
-  local cat_axis=100000+chart_id*2; local val_axis=cat_axis+1
+  local x_axis=100000+chart_id*2; local y_axis=x_axis+1
   local b={'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>','<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart>',chart_title_xml(chart.title),'<c:plotArea><c:layout/>'}
-  if chart.type=='line' then b[#b+1]='<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>' else b[#b+1]='<c:barChart><c:barDir val="'..(chart.type=='bar' and 'bar' or 'col')..'"/><c:grouping val="clustered"/><c:varyColors val="0"/>' end
+  local tag=({line='lineChart',column='barChart',bar='barChart',pie='pieChart',doughnut='doughnutChart',area='areaChart',scatter='scatterChart'})[chart.type]
+  b[#b+1]='<c:'..tag..'>'
+  if chart.type=='line' or chart.type=='area' then b[#b+1]='<c:grouping val="'..CHART_GROUPINGS[chart.grouping]..'"/><c:varyColors val="0"/>'
+  elseif chart.type=='column' or chart.type=='bar' then b[#b+1]='<c:barDir val="'..(chart.type=='bar' and 'bar' or 'col')..'"/><c:grouping val="'..CHART_GROUPINGS[chart.grouping]..'"/><c:varyColors val="0"/>'
+  elseif chart.type=='pie' or chart.type=='doughnut' then b[#b+1]='<c:varyColors val="1"/>' end
   for i,series in ipairs(chart.series) do
     b[#b+1]='<c:ser><c:idx val="'..(i-1)..'"/><c:order val="'..(i-1)..'"/>'
-    if series.name_ref then b[#b+1]='<c:tx><c:strRef><c:f>'..esc_xml(series.name_ref,"référence de série",0)..'</c:f></c:strRef></c:tx>'
-    elseif series.name then b[#b+1]='<c:tx><c:v>'..esc_xml(series.name,"nom de série",0)..'</c:v></c:tx>' end
-    if chart.type=='line' then b[#b+1]='<c:marker><c:symbol val="none"/></c:marker>' end
-    b[#b+1]='<c:cat><c:strRef><c:f>'..esc_xml(chart.categories,"catégories",0)..'</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>'..esc_xml(series.values,"valeurs",0)..'</c:f></c:numRef></c:val></c:ser>'
+    if series.name_ref then b[#b+1]='<c:tx><c:strRef><c:f>'..esc_xml(series.name_ref,'référence de série',0)..'</c:f></c:strRef></c:tx>' elseif series.name then b[#b+1]='<c:tx><c:v>'..esc_xml(series.name,'nom de série',0)..'</c:v></c:tx>' end
+    local line_only=chart.type=='line' or chart.type=='scatter'; b[#b+1]=series_shape_xml(series,line_only)
+    if chart.type=='line' or chart.type=='scatter' then b[#b+1]='<c:marker><c:symbol val="'..(series.marker or 'none')..'"/></c:marker>' end
+    if chart.type=='scatter' then
+      b[#b+1]='<c:xVal><c:numRef><c:f>'..esc_xml(series.x_values,'valeurs X',0)..'</c:f></c:numRef></c:xVal><c:yVal><c:numRef><c:f>'..esc_xml(series.values,'valeurs Y',0)..'</c:f></c:numRef></c:yVal>'
+    else
+      b[#b+1]='<c:cat><c:strRef><c:f>'..esc_xml(chart.categories,'catégories',0)..'</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>'..esc_xml(series.values,'valeurs',0)..'</c:f></c:numRef></c:val>'
+    end
+    if chart.type=='line' or chart.type=='scatter' then b[#b+1]='<c:smooth val="'..(series.smooth and '1' or '0')..'"/>' end
+    b[#b+1]='</c:ser>'
   end
-  if chart.type=='line' then b[#b+1]='<c:smooth val="0"/><c:axId val="'..cat_axis..'"/><c:axId val="'..val_axis..'"/></c:lineChart>' else b[#b+1]='<c:gapWidth val="150"/><c:axId val="'..cat_axis..'"/><c:axId val="'..val_axis..'"/></c:barChart>' end
-  b[#b+1]='<c:catAx><c:axId val="'..cat_axis..'"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:numFmt formatCode="General" sourceLinked="1"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crossAx val="'..val_axis..'"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/></c:catAx>'
-  b[#b+1]='<c:valAx><c:axId val="'..val_axis..'"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines/><c:numFmt formatCode="General" sourceLinked="1"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crossAx val="'..cat_axis..'"/><c:crosses val="autoZero"/><c:crossBetween val="between"/></c:valAx></c:plotArea>'
-  if chart.legend then b[#b+1]='<c:legend><c:legendPos val="r"/><c:layout/><c:overlay val="0"/></c:legend>' end
+  b[#b+1]=data_labels_xml(chart.data_labels)
+  if chart.type=='doughnut' then b[#b+1]='<c:firstSliceAng val="0"/><c:holeSize val="'..math.floor(chart.hole_size+0.5)..'"/>'
+  elseif chart.type=='pie' then b[#b+1]='<c:firstSliceAng val="0"/>'
+  elseif chart.type=='column' or chart.type=='bar' then b[#b+1]='<c:gapWidth val="150"/>'; if chart.grouping~='standard' then b[#b+1]='<c:overlap val="100"/>' end end
+  if chart.type~='pie' and chart.type~='doughnut' then b[#b+1]='<c:axId val="'..x_axis..'"/><c:axId val="'..y_axis..'"/>' end
+  b[#b+1]='</c:'..tag..'>'
+  if chart.type=='scatter' then
+    b[#b+1]=chart_axis_xml('valAx',x_axis,y_axis,'b',chart.x_axis,false); b[#b+1]=chart_axis_xml('valAx',y_axis,x_axis,'l',chart.y_axis,false)
+  elseif chart.type~='pie' and chart.type~='doughnut' then
+    b[#b+1]=chart_axis_xml('catAx',x_axis,y_axis,'b',chart.x_axis,true); b[#b+1]=chart_axis_xml('valAx',y_axis,x_axis,'l',chart.y_axis,false)
+  end
+  b[#b+1]='</c:plotArea>'
+  if chart.legend then b[#b+1]='<c:legend><c:legendPos val="'..LEGEND_POSITIONS[chart.legend_position]..'"/><c:layout/><c:overlay val="0"/></c:legend>' end
   b[#b+1]='<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/><c:showDLblsOverMax val="0"/></c:chart></c:chartSpace>'
   return table.concat(b)
 end
-
 local function drawing_xml(sheet)
   local b={'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>','<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'}
   local rels={}; local object_id=1
@@ -2170,6 +2592,8 @@ function Workbook:_parts()
       t[#t+1]='<Default Extension="jpeg" ContentType="image/jpeg"/>'
     end
     t[#t + 1] = '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    t[#t + 1] = '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+    t[#t + 1] = '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
     for i = 1, nsheets do
       t[#t + 1] = '<Override PartName="/xl/worksheets/sheet' .. i ..
         '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
@@ -2190,6 +2614,8 @@ function Workbook:_parts()
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>',
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>',
+    '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>',
     '</Relationships>',
   }))
 
@@ -2197,7 +2623,14 @@ function Workbook:_parts()
     local t = {}
     t[#t + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     t[#t + 1] = '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-    if self._date1904 then t[#t + 1] = '<workbookPr date1904="1"/>' end
+    t[#t + 1] = self._date1904 and '<workbookPr date1904="1"/>' or '<workbookPr/>'
+    if self._workbook_protection then
+      local p=self._workbook_protection; local attrs={}
+      if p.password_hash then attrs[#attrs+1]='workbookPassword="'..p.password_hash..'"' end
+      if p.structure then attrs[#attrs+1]='lockStructure="1"' end
+      if p.windows then attrs[#attrs+1]='lockWindows="1"' end
+      t[#t+1]='<workbookProtection '..table.concat(attrs,' ')..'/>'
+    end
     t[#t + 1] = '<bookViews><workbookView activeTab="' .. (self._active_sheet - 1) .. '"/></bookViews>'
     t[#t + 1] = '<sheets>'
     for i = 1, nsheets do
@@ -2264,10 +2697,34 @@ function Workbook:_parts()
     t[#t + 1] = '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="' ..
       #sst .. '" uniqueCount="' .. #sst .. '">'
     for i = 1, #sst do
-      t[#t + 1] = '<si><t xml:space="preserve">' .. esc(sst[i]) .. '</t></si>'
+      local item=sst[i]
+      if getmetatable(item)==RICH_TEXT_MT then
+        local data=RICH_TEXT_DATA[item]; t[#t+1]='<si>'
+        for _,run in ipairs(data.runs) do
+          t[#t+1]='<r><rPr>'
+          if run.bold then t[#t+1]='<b/>' end; if run.italic then t[#t+1]='<i/>' end
+          if run.underline=='single' then t[#t+1]='<u/>' elseif run.underline=='double' then t[#t+1]='<u val="double"/>' end
+          if run.strike then t[#t+1]='<strike/>' end
+          if run.font_color then t[#t+1]='<color rgb="'..run.font_color..'"/>' end
+          if run.font_size then t[#t+1]='<sz val="'..num2str(run.font_size)..'"/>' end
+          if run.font_name then t[#t+1]='<rFont val="'..esc_xml(run.font_name,"police enrichie",0)..'"/>' end
+          t[#t+1]='</rPr><t xml:space="preserve">'..esc(run.text)..'</t></r>'
+        end
+        t[#t+1]='</si>'
+      else t[#t + 1] = '<si><t xml:space="preserve">' .. esc(item) .. '</t></si>' end
     end
     t[#t + 1] = '</sst>'
     add("xl/sharedStrings.xml", table.concat(t))
+  end
+
+  do
+    local p=self._properties or {}; local t={'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>','<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">'}
+    local tags={creator='dc:creator',title='dc:title',description='dc:description',subject='dc:subject',category='cp:category',keywords='cp:keywords'}
+    for _,key in ipairs({'creator','title','description','subject','category','keywords'}) do if p[key] then t[#t+1]='<'..tags[key]..'>'..esc_xml(p[key],"propriété",0)..'</'..tags[key]..'>' end end
+    t[#t+1]='</cp:coreProperties>'; add('docProps/core.xml',table.concat(t))
+    local a={'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>','<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>lua-xlsx</Application><AppVersion>1.5</AppVersion>'}
+    if p.company then a[#a+1]='<Company>'..esc_xml(p.company,"société",0)..'</Company>' end; if p.manager then a[#a+1]='<Manager>'..esc_xml(p.manager,"responsable",0)..'</Manager>' end
+    a[#a+1]='</Properties>'; add('docProps/app.xml',table.concat(a))
   end
 
   add("xl/styles.xml", build_styles_xml(self._style_registry))
@@ -2756,22 +3213,51 @@ local function ref_to_rowcol(ref)
   return row, col
 end
 
+local function parse_rich_text_container(xml)
+  local buf, runs = {}, {}
+  for body in xml:gmatch("<r[^>]*>(.-)</r>") do
+    local text = unescape(body:match("<t[^>]*>(.-)</t>") or "")
+    local props = body:match("<rPr>(.-)</rPr>") or ""
+    local underline = props:match('<u[^>]-val="([^"]+)"')
+      or (props:find("<u/>", 1, true) and "single" or nil)
+    local color = props:match('<color[^>]-rgb="([%x]+)"')
+      or props:match('<color[^>]-val="([%x]+)"')
+    runs[#runs + 1] = {
+      text = text,
+      bold = props:find("<b", 1, true) ~= nil,
+      italic = props:find("<i", 1, true) ~= nil,
+      underline = underline,
+      strike = props:find("<strike", 1, true) ~= nil,
+      font_name = unescape(props:match('<rFont[^>]-val="([^"]+)"')
+        or props:match('<name[^>]-val="([^"]+)"') or ""),
+      font_size = tonumber(props:match('<sz[^>]-val="([^"]+)"')),
+      font_color = color and normalize_color(color, "couleur enrichie", 0) or nil,
+    }
+    if runs[#runs].font_name == "" then runs[#runs].font_name = nil end
+    buf[#buf + 1] = text
+  end
+  if #runs == 0 then
+    for text in xml:gmatch("<t[^>]*>(.-)</t>") do buf[#buf + 1] = unescape(text) end
+    return table.concat(buf), nil
+  end
+  local obj = setmetatable({}, RICH_TEXT_MT)
+  RICH_TEXT_DATA[obj] = { runs = runs, text = table.concat(buf) }
+  return table.concat(buf), obj
+end
+
 local function parse_shared_strings(xml)
-  local res = {}
+  local res, rich = {}, {}
   local idx = 0
   xml = xml:gsub("<si%s*/>", "<si></si>")
   for si in xml:gmatch("<si[%s>].-</si>") do
-    local buf = {}
-    for t in si:gmatch("<t[^>]*>(.-)</t>") do
-      buf[#buf + 1] = unescape(t)
-    end
-    res[idx] = table.concat(buf)
+    local text, obj = parse_rich_text_container(si)
+    res[idx] = text
+    if obj then rich[idx] = obj end
     idx = idx + 1
   end
-  return res  -- 0-indexé
+  return res, rich
 end
-
-local function decode_cell(inner, ty, shared)
+local function decode_cell(inner, ty, shared, rich_shared)
   if ty == "s" then
     local raw = inner:match("<v>(.-)</v>")
     if not raw then return nil end
@@ -2779,16 +3265,14 @@ local function decode_cell(inner, ty, shared)
     if not index or math.type(index) ~= "integer" or index < 0 or shared[index] == nil then
       error("xlsx: index sharedStrings invalide : " .. tostring(raw), 0)
     end
-    return shared[index]
+    return shared[index], rich_shared and rich_shared[index] or nil
   elseif ty == "b" then
     local raw = inner:match("<v>(.-)</v>")
     if raw == "1" then return true end
     if raw == "0" then return false end
     error("xlsx: booléen de cellule invalide", 0)
   elseif ty == "inlineStr" then
-    local buf = {}
-    for text in inner:gmatch("<t[^>]*>(.-)</t>") do buf[#buf + 1] = unescape(text) end
-    return table.concat(buf)
+    return parse_rich_text_container(inner)
   elseif ty == "str" or ty == "d" or ty == "e" then
     local raw = inner:match("<v>(.-)</v>")
     return raw and unescape(raw) or nil
@@ -2942,6 +3426,14 @@ local function parse_styles(xml)
     local fill = fills[tonumber(xml_attr(attrs, "fillId") or "0")]
     local border = borders[tonumber(xml_attr(attrs, "borderId") or "0")]
     local alignment_attrs = body:match("<alignment%s*(.-)/>") or body:match("<alignment%s*(.-)>")
+    local protection_attrs = body:match("<protection%s*(.-)/>") or body:match("<protection%s*(.-)>")
+    local locked, hidden
+    if protection_attrs then
+      local locked_attr = xml_attr(protection_attrs, "locked")
+      local hidden_attr = xml_attr(protection_attrs, "hidden")
+      locked = not (locked_attr == "0" or locked_attr == "false")
+      hidden = hidden_attr == "1" or hidden_attr == "true"
+    end
     local data = {
       bold=font.bold == true, italic=font.italic == true, underline=font.underline,
       strike=font.strike == true, font_name=font.font_name, font_size=font.font_size,
@@ -2950,6 +3442,7 @@ local function parse_styles(xml)
       vertical=xml_attr(alignment_attrs, "vertical"),
       wrap_text=xml_attr(alignment_attrs, "wrapText") == "1" or xml_attr(alignment_attrs, "wrapText") == "true",
       number_format=fmtcode[numFmtId] or (numFmtId ~= 0 and BUILTIN_NUMFMT[numFmtId] or nil),
+      locked=locked, hidden=hidden,
       border=copy_border(border),
     }
     local style_index = idx - 1
@@ -2957,7 +3450,7 @@ local function parse_styles(xml)
     local is_default = style_index == 0 or (not data.bold and not data.italic and not data.underline and
       not data.strike and (not data.font_name or data.font_name == "Calibri") and
       (not data.font_size or data.font_size == 11) and not data.font_color and not data.fill_color and
-      not data.horizontal and not data.vertical and not data.wrap_text and not data.number_format and not data.border)
+      not data.horizontal and not data.vertical and not data.wrap_text and not data.number_format and data.locked==nil and data.hidden==nil and not data.border)
     style_objects[style_index] = is_default and false or style_object_from_data(data)
   end
   local dxfs = xml:match("<dxfs[^>]*>(.-)</dxfs>") or ""
@@ -3004,8 +3497,8 @@ local function parse_comments(xml)
   return map, list
 end
 
-local function parse_sheet(xml, shared, datestyle, style_objects, dxf_objects, date1904, relationships, comment_xml)
-  local cells, formulas, styles = {}, {}, {}
+local function parse_sheet(xml, shared, rich_shared, datestyle, style_objects, dxf_objects, date1904, relationships, comment_xml)
+  local cells, formulas, styles, rich_text = {}, {}, {}, {}
   local row_heights, column_widths, row_hidden, column_hidden = {}, {}, {}, {}
   local maxrow, maxcol = -1, -1
 
@@ -3056,8 +3549,9 @@ local function parse_sheet(xml, shared, datestyle, style_objects, dxf_objects, d
             local sr = styles[r0]; if not sr then sr = {}; styles[r0] = sr end
             sr[c0] = style_objects[st] or false
           end
-          local raw_value = decode_cell(inner, ty, shared)
+          local raw_value, rich_value = decode_cell(inner, ty, shared, rich_shared)
           local display_value = raw_value
+          if rich_value then local rr=rich_text[r0]; if not rr then rr={}; rich_text[r0]=rr end; rr[c0]=rich_value end
           if type(display_value) == "number" and st then
             local cls = datestyle[st]
             if cls then display_value = serial_to_iso(display_value, cls == "datetime", date1904) end
@@ -3147,18 +3641,39 @@ local function parse_sheet(xml, shared, datestyle, style_objects, dxf_objects, d
     end
   end
   local conditional_formats = {}
+  local function parse_cfvo(body)
+    local out={}
+    for attrs in body:gmatch("<cfvo%s+(.-)/>") do
+      local raw_type=xml_attr(attrs,"type")
+      out[#out+1]={type=CFVO_FROM_XML[raw_type] or raw_type,value=tonumber(xml_attr(attrs,"val")) or xml_attr(attrs,"val")}
+    end
+    return out
+  end
   for cfattrs, cfbody in xml:gmatch("<conditionalFormatting%s+(.-)>(.-)</conditionalFormatting>") do
     local ref = xml_attr(cfattrs, "sqref")
     for attrs, inner in cfbody:gmatch("<cfRule%s+(.-)>(.-)</cfRule>") do
       local xmltype = xml_attr(attrs, "type")
       local kind = CF_TYPE_FROM_XML[xmltype] or xmltype
+      if xmltype=="top10" then kind=(xml_attr(attrs,"bottom")=="1" or xml_attr(attrs,"bottom")=="true") and "bottom" or "top" end
+      if xmltype=="aboveAverage" then kind=(xml_attr(attrs,"aboveAverage")=="0" or xml_attr(attrs,"aboveAverage")=="false") and "below_average" or "above_average" end
       local formulas = {}; for formula in inner:gmatch("<formula>(.-)</formula>") do formulas[#formulas + 1] = unescape(formula) end
-      conditional_formats[#conditional_formats + 1] = {
-        ref=ref, type=kind, operator=VALIDATION_OPERATOR_FROM_XML[xml_attr(attrs, "operator")],
-        text=(xml_attr(attrs, "text") and unescape(xml_attr(attrs, "text"))), stop_if_true=xml_attr(attrs, "stopIfTrue") == "1" or xml_attr(attrs, "stopIfTrue") == "true",
-        priority=tonumber(xml_attr(attrs, "priority")), style=dxf_objects[tonumber(xml_attr(attrs, "dxfId") or "-1")],
-        formula1=formulas[1], formula2=formulas[2],
-      }
+      local item={ref=ref,type=kind,operator=VALIDATION_OPERATOR_FROM_XML[xml_attr(attrs,"operator")],text=(xml_attr(attrs,"text") and unescape(xml_attr(attrs,"text"))),
+        stop_if_true=xml_attr(attrs,"stopIfTrue")=="1" or xml_attr(attrs,"stopIfTrue")=="true",priority=tonumber(xml_attr(attrs,"priority")),
+        style=dxf_objects[tonumber(xml_attr(attrs,"dxfId") or "-1")],formula1=formulas[1],formula2=formulas[2]}
+      if kind=="color_scale" then
+        local body=inner:match("<colorScale>(.-)</colorScale>") or ""; local v=parse_cfvo(body); item.min=v[1]; item.mid=#v==3 and v[2] or nil; item.max=v[#v]
+        local colors={}; for c in body:gmatch('<color[^>]-rgb="([%x]+)"') do colors[#colors+1]=normalize_color(c,"couleur conditionnelle",0) end
+        item.min_color=colors[1]; item.mid_color=#colors==3 and colors[2] or nil; item.max_color=colors[#colors]
+      elseif kind=="data_bar" then
+        local body=inner:match("<dataBar%s*(.-)>(.-)</dataBar>"); local dattrs,dbody=inner:match("<dataBar%s*(.-)>(.-)</dataBar>"); local v=parse_cfvo(dbody or "")
+        item.start=v[1]; item.finish=v[2]; local c=(dbody or ""):match('<color[^>]-rgb="([%x]+)"'); item.color=c and normalize_color(c,"barre",0) or nil
+        item.show_value=not (xml_attr(dattrs,"showValue")=="0" or xml_attr(dattrs,"showValue")=="false")
+      elseif kind=="icon_set" then
+        local iattrs,ibody=inner:match("<iconSet%s*(.-)>(.-)</iconSet>"); item.icons=ICON_SETS_FROM_XML[xml_attr(iattrs,"iconSet")] or xml_attr(iattrs,"iconSet")
+        item.thresholds=parse_cfvo(ibody or ""); item.show_value=not (xml_attr(iattrs,"showValue")=="0" or xml_attr(iattrs,"showValue")=="false"); item.reverse=xml_attr(iattrs,"reverse")=="1" or xml_attr(iattrs,"reverse")=="true"
+      elseif kind=="top" or kind=="bottom" then item.rank=tonumber(xml_attr(attrs,"rank")) or 10; item.percent=xml_attr(attrs,"percent")=="1" or xml_attr(attrs,"percent")=="true"; item.bottom=kind=="bottom"
+      elseif kind=="above_average" or kind=="below_average" then item.above_average=kind=="above_average" end
+      conditional_formats[#conditional_formats+1]=item
     end
   end
   table.sort(conditional_formats, function(a,b) return (a.priority or 0) < (b.priority or 0) end)
@@ -3190,11 +3705,30 @@ local function parse_sheet(xml, shared, datestyle, style_objects, dxf_objects, d
       different_first=xml_attr(hf_attrs,"differentFirst")=="1" or xml_attr(hf_attrs,"differentFirst")=="true",
       different_odd_even=xml_attr(hf_attrs,"differentOddEven")=="1" or xml_attr(hf_attrs,"differentOddEven")=="true" }
   end
+  local sheet_protection
+  local prot_attrs=xml:match("<sheetProtection%s+(.-)/>")
+  if prot_attrs then
+    sheet_protection={password_hash=xml_attr(prot_attrs,"password")}
+    local names={select_locked_cells="selectLockedCells",select_unlocked_cells="selectUnlockedCells",format_cells="formatCells",format_columns="formatColumns",format_rows="formatRows",insert_columns="insertColumns",insert_rows="insertRows",insert_hyperlinks="insertHyperlinks",delete_columns="deleteColumns",delete_rows="deleteRows",sort="sort",auto_filter="autoFilter",pivot_tables="pivotTables",objects="objects",scenarios="scenarios"}
+    for key,attr in pairs(names) do sheet_protection[key]=xml_attr(prot_attrs,attr)=="1" or xml_attr(prot_attrs,attr)=="true" end
+  end
+  local row_page_breaks,column_page_breaks={},{}
+  local rb=xml:match("<rowBreaks[^>]*>(.-)</rowBreaks>") or ""; for attrs in rb:gmatch("<brk%s+(.-)/>") do local id=tonumber(xml_attr(attrs,"id")); if id then row_page_breaks[#row_page_breaks+1]=id end end
+  local cb=xml:match("<colBreaks[^>]*>(.-)</colBreaks>") or ""; for attrs in cb:gmatch("<brk%s+(.-)/>") do local id=tonumber(xml_attr(attrs,"id")); if id then column_page_breaks[#column_page_breaks+1]=id end end
+  local sparklines={}; local plain_ext=xml:gsub("x14:",""):gsub("xm:","")
+  for attrs,body in plain_ext:gmatch("<sparklineGroup%s*(.-)>(.-)</sparklineGroup>") do
+    local source=unescape(body:match("<f>(.-)</f>") or ""); local target=unescape(body:match("<sqref>(.-)</sqref>") or "")
+    local st=xml_attr(attrs,"type") or "line"; if st=="stacked" then st="win_loss" end
+    local item={source=source,target=target,type=st,show_markers=xml_attr(attrs,"markers")=="1",show_high=xml_attr(attrs,"high")=="1",show_low=xml_attr(attrs,"low")=="1",show_first=xml_attr(attrs,"first")=="1",show_last=xml_attr(attrs,"last")=="1",show_negative=xml_attr(attrs,"negative")=="1",right_to_left=xml_attr(attrs,"rightToLeft")=="1"}
+    local colors={color="colorSeries",negative_color="colorNegative",high_color="colorHigh",low_color="colorLow",first_color="colorFirst",last_color="colorLast"}
+    for key,tag in pairs(colors) do local c=body:match('<'..tag..'[^>]-rgb="([%x]+)"'); if c then item[key]=normalize_color(c,"sparkline",0) end end
+    sparklines[#sparklines+1]=item
+  end
   local comment_map, comment_list = parse_comments(comment_xml)
   return cells, formulas, styles, maxrow, maxcol, row_heights, column_widths,
     freeze_rows, freeze_cols, auto_filter, merged, hyperlink_ranges,
     row_hidden, column_hidden, data_validations, conditional_formats, tab_color, comment_map, comment_list,
-    page_margins, page_setup, print_options, header_footer
+    page_margins, page_setup, print_options, header_footer, rich_text, sheet_protection, row_page_breaks, column_page_breaks, sparklines
 end
 
 local function package_path(base, target)
@@ -3226,38 +3760,95 @@ end
 
 local function parse_chart_part(xml)
   local plain=xml:gsub("c:",""):gsub("a:","")
-  local kind="line"; if plain:find("<barChart",1,true) then kind=(plain:match('<barDir%s+val="([^"]+)"')=="bar") and "bar" or "column" end
+  local kind="line"
+  if plain:find("<pieChart",1,true) then kind="pie"
+  elseif plain:find("<doughnutChart",1,true) then kind="doughnut"
+  elseif plain:find("<areaChart",1,true) then kind="area"
+  elseif plain:find("<scatterChart",1,true) then kind="scatter"
+  elseif plain:find("<barChart",1,true) then kind=(plain:match('<barDir%s+val="([^"]+)"')=="bar") and "bar" or "column" end
   local title=plain:match("<title>.-<t>(.-)</t>.-</title>"); if title then title=unescape(title) end
+  local chart_tag=({line='lineChart',column='barChart',bar='barChart',pie='pieChart',doughnut='doughnutChart',area='areaChart',scatter='scatterChart'})[kind]
+  local chart_body=plain:match('<'..chart_tag..'>(.-)</'..chart_tag..'>') or plain
   local series={}; local categories
-  for body in plain:gmatch("<ser>(.-)</ser>") do
+  for body in chart_body:gmatch("<ser>(.-)</ser>") do
     local name=body:match("<tx>.-<v>(.-)</v>.-</tx>"); local name_ref=body:match("<tx>.-<strRef>.-<f>(.-)</f>")
-    local cat=body:match("<cat>.-<f>(.-)</f>"); local values=body:match("<val>.-<f>(.-)</f>")
+    local cat=body:match("<cat>.-<f>(.-)</f>"); local values=body:match("<val>.-<f>(.-)</f>") or body:match("<yVal>.-<f>(.-)</f>"); local xv=body:match("<xVal>.-<f>(.-)</f>")
     if not categories and cat then categories=unescape(cat) end
-    series[#series+1]={ name=name and unescape(name) or nil, name_ref=name_ref and unescape(name_ref) or nil, values=values and unescape(values) or nil }
+    local color=body:match('<srgbClr%s+val="([%x]+)"'); if color then color=normalize_color(color,'couleur de série',0) end
+    local width=tonumber(body:match('<ln[^>]-w="(%d+)"'))
+    series[#series+1]={ name=name and unescape(name) or nil, name_ref=name_ref and unescape(name_ref) or nil, values=values and unescape(values) or nil,
+      x_values=xv and unescape(xv) or nil, color=color, marker=body:match('<symbol%s+val="([^"]+)"'),
+      line_width=width and width/12700 or nil, smooth=body:match('<smooth%s+val="1"')~=nil }
   end
-  return { type=kind,title=title,categories=categories,series=series,legend=plain:find("<legend",1,true)~=nil }
+  local grouping=chart_body:match('<grouping%s+val="([^"]+)"') or 'standard'; if grouping=='percentStacked' then grouping='percent_stacked' end
+  local legendpos=plain:match('<legendPos%s+val="([^"]+)"')
+  local hole=tonumber(chart_body:match('<holeSize%s+val="([^"]+)"'))
+
+  local label_positions={ctr='center',inEnd='inside_end',inBase='inside_base',outEnd='outside_end',bestFit='best_fit',l='left',r='right',t='top',b='bottom'}
+  local data_labels
+  local label_body=chart_body:match("<dLbls>(.-)</dLbls>")
+  if label_body then
+    local function flag(tag) return label_body:match('<'..tag..'%s+val="1"')~=nil or label_body:match('<'..tag..'%s+val="true"')~=nil end
+    local pos=label_body:match('<dLblPos%s+val="([^"]+)"')
+    data_labels={show_value=flag('showVal'),show_percent=flag('showPercent'),show_category=flag('showCatName'),show_series_name=flag('showSerName'),position=label_positions[pos]}
+  end
+
+  local function parse_axis(body)
+    if not body then return {} end
+    local axis_title=body:match("<title>.-<t>(.-)</t>.-</title>")
+    local min=tonumber(body:match('<min%s+val="([^"]+)"'))
+    local max=tonumber(body:match('<max%s+val="([^"]+)"'))
+    local fmt=body:match('<numFmt%s+[^>]-formatCode="([^"]*)"')
+    return { title=axis_title and unescape(axis_title) or nil, min=min, max=max,
+      number_format=fmt and unescape(fmt) or nil, major_gridlines=body:find("<majorGridlines",1,true)~=nil }
+  end
+  local x_axis,y_axis={},{}
+  local function capture_axes(tag)
+    for body in plain:gmatch('<'..tag..'>(.-)</'..tag..'>') do
+      local pos=body:match('<axPos%s+val="([^"]+)"')
+      if pos=='b' or pos=='t' then x_axis=parse_axis(body)
+      elseif pos=='l' or pos=='r' then y_axis=parse_axis(body) end
+    end
+  end
+  capture_axes('catAx'); capture_axes('valAx')
+
+  return { type=kind,title=title,categories=categories,series=series,legend=plain:find("<legend",1,true)~=nil,
+    legend_position=LEGEND_POSITIONS_FROM_XML[legendpos] or 'right',grouping=grouping,hole_size=hole,
+    data_labels=data_labels,x_axis=x_axis,y_axis=y_axis }
 end
 
 local function parse_drawing_part(xml, relxml, drawing_path, byname, data, limits)
   local relationships=parse_relationships(relxml); local plain=xml:gsub("xdr:",""):gsub("a:",""):gsub("c:","")
   local images,charts={},{}; local base=drawing_path:match("^(.*[/])") or ""
-  for anchor in plain:gmatch("<oneCellAnchor>(.-)</oneCellAnchor>") do
-    local col=tonumber(anchor:match("<from>.-<col>(%d+)</col>")) or 0; local row=tonumber(anchor:match("<from>.-<row>(%d+)</row>")) or 0
-    local cx,cy=anchor:match('<ext%s+cx="(%d+)"%s+cy="(%d+)"'); local width,height=(tonumber(cx) or 0)/9525,(tonumber(cy) or 0)/9525
+  local function process_anchor(anchor)
+    local from=anchor:match("<from>(.-)</from>") or ""
+    local col=tonumber(from:match("<col>(%d+)</col>")) or 0
+    local row=tonumber(from:match("<row>(%d+)</row>")) or 0
+    local cx,cy=anchor:match('<ext%s+[^>]-cx="(%d+)"[^>]-cy="(%d+)"')
+    if not cx then cx,cy=anchor:match('<ext%s+[^>]-cy="(%d+)"[^>]-cx="(%d+)"'); cx,cy=cy,cx end
+    local width,height=(tonumber(cx) or 0)/9525,(tonumber(cy) or 0)/9525
     if anchor:find("<pic>",1,true) then
       local rid=anchor:match('blip[^>]-r:embed="([^"]+)"'); local rel=rid and relationships[rid]
-      if rel then local path=package_path(base,rel.target); local entry=path and byname[path]; local binary=entry and zip_extract(data,entry,limits) or nil
+      if rel then
+        local path=package_path(base,rel.target); local entry=path and byname[path]; local binary=entry and zip_extract(data,entry,limits) or nil
         local format=path and path:match("%.([^.]+)$") or nil; if format=="jpg" then format="jpeg" end
-        local nattrs=anchor:match("<cNvPr%s+(.-)/>") or ""
+        local nattrs=anchor:match("<cNvPr%s+([^>]-)/?>") or ""
         images[#images+1]={row=row,col=col,width=width,height=height,format=format,name=xml_attr(nattrs,"name"),alt_text=xml_attr(nattrs,"descr"),data=binary,path=path}
       end
     elseif anchor:find("<graphicFrame",1,true) then
       local rid=anchor:match('chart[^>]-r:id="([^"]+)"'); local rel=rid and relationships[rid]
-      if rel then local path=package_path(base,rel.target); local entry=path and byname[path]
-        if entry then local chart=parse_chart_part(validate_xml_document(zip_extract(data,entry,limits),path)); chart.row,chart.col,chart.width,chart.height,chart.path=row,col,width,height,path; charts[#charts+1]=chart end
+      if rel then
+        local path=package_path(base,rel.target); local entry=path and byname[path]
+        if entry then
+          local chart=parse_chart_part(validate_xml_document(zip_extract(data,entry,limits),path))
+          chart.row,chart.col,chart.width,chart.height,chart.path=row,col,width,height,path
+          charts[#charts+1]=chart
+        end
       end
     end
   end
+  for anchor in plain:gmatch("<oneCellAnchor[^>]*>(.-)</oneCellAnchor>") do process_anchor(anchor) end
+  for anchor in plain:gmatch("<twoCellAnchor[^>]*>(.-)</twoCellAnchor>") do process_anchor(anchor) end
   return images,charts
 end
 
@@ -3308,7 +3899,10 @@ local function parse_workbook(wbxml, relsxml)
       comment=(xml_attr(attrs, "comment") and unescape(xml_attr(attrs, "comment"))),
     } end
   end
-  return sheets, date1904, active_sheet, defined_names
+  local workbook_protection
+  local pattrs=wbxml:match("<workbookProtection%s+(.-)/>")
+  if pattrs then workbook_protection={password_hash=xml_attr(pattrs,"workbookPassword"),structure=xml_attr(pattrs,"lockStructure")=="1" or xml_attr(pattrs,"lockStructure")=="true",windows=xml_attr(pattrs,"lockWindows")=="1" or xml_attr(pattrs,"lockWindows")=="true"} end
+  return sheets, date1904, active_sheet, defined_names, workbook_protection
 end
 
 -- ----------------------------------------------------------------------------
@@ -3427,6 +4021,13 @@ function ReadSheet:get_page_setup()
   local out=shallow_copy(self.page_setup or {}); for k,v in pairs(self.print_options or {}) do out[k]=v end; return out
 end
 function ReadSheet:get_header_footer() return self.header_footer and shallow_copy(self.header_footer) or nil end
+function ReadSheet:get_rich_text(row,col)
+  check_index(row,"row",3); check_index(col,"col",3); local rr=self.rich_text[row]; local v=rr and rr[col]; return v
+end
+function ReadSheet:get_protection() return self.sheet_protection and shallow_copy(self.sheet_protection) or nil end
+function ReadSheet:get_row_page_breaks() return {table.unpack(self.row_page_breaks or {})} end
+function ReadSheet:get_column_page_breaks() return {table.unpack(self.column_page_breaks or {})} end
+function ReadSheet:get_sparklines() local out={}; for i,v in ipairs(self.sparkline_list or {}) do out[i]=shallow_copy(v) end; return out end
 function ReadSheet:get_print_area() return self.print_area end
 function ReadSheet:get_print_titles() return self.repeat_rows, self.repeat_cols end
 
@@ -3485,6 +4086,9 @@ function ReadWB:get_defined_name(name, local_sheet)
   return nil
 end
 
+function ReadWB:get_properties() return shallow_copy(self._properties or {}) end
+function ReadWB:get_protection() return self._workbook_protection and shallow_copy(self._workbook_protection) or nil end
+
 local function rels_path_for_part(part)
   local dir, file = part:match("^(.-)([^/]+)$")
   if not dir then return "_rels/" .. part .. ".rels" end
@@ -3525,8 +4129,8 @@ function ReadWB:sheet(which)
         if te then local t=parse_table_part(validate_xml_document(zip_extract(self._data,te,self._limits),path)); t.path=path; table_list[#table_list+1]=t end
       end
     end
-    local values={ parse_sheet(xml, self._shared, self._datestyle, self._style_objects, self._dxf_objects, self._date1904, relationships, comment_xml) }
-    values[24],values[25],values[26]=image_list,chart_list,table_list
+    local values={ parse_sheet(xml, self._shared, self._rich_shared, self._datestyle, self._style_objects, self._dxf_objects, self._date1904, relationships, comment_xml) }
+    values[29],values[30],values[31]=image_list,chart_list,table_list
     return values
   end)
   if not ok then return nil, tostring(result) end
@@ -3539,7 +4143,8 @@ function ReadWB:sheet(which)
     row_hidden=values[13], column_hidden=values[14], data_validations=values[15],
     conditional_formats=values[16], tab_color=values[17], comment_map=values[18], comment_list=values[19],
     page_margins=values[20], page_setup=values[21], print_options=values[22], header_footer=values[23],
-    image_list=values[24], chart_list=values[25], table_list=values[26],
+    rich_text=values[24], sheet_protection=values[25], row_page_breaks=values[26], column_page_breaks=values[27], sparkline_list=values[28],
+    image_list=values[29], chart_list=values[30], table_list=values[31],
     print_area=def.print_area, repeat_rows=def.repeat_rows, repeat_cols=def.repeat_cols,
     visibility=def.visibility or "visible",
   }, ReadSheet)
@@ -3627,6 +4232,16 @@ local function validate_with_babet(path, opts)
   return true
 end
 
+local function parse_document_properties(core, app)
+  local out={}
+  if core then
+    local tags={creator="creator",title="title",description="description",subject="subject",category="category",keywords="keywords"}
+    for key,tag in pairs(tags) do local value=core:match("<[^>]*"..tag.."[^>]*>(.-)</[^>]*"..tag..">"); if value then out[key]=unescape(value) end end
+  end
+  if app then local company=app:match("<Company>(.-)</Company>"); local manager=app:match("<Manager>(.-)</Manager>"); if company then out.company=unescape(company) end; if manager then out.manager=unescape(manager) end end
+  return out
+end
+
 --- Ouvre un .xlsx en lecture. Renvoie un workbook, ou (nil, err).
 function xlsx.open(path, opts)
   if type(path) ~= "string" then error("xlsx: open attend un chemin (string)", 2) end
@@ -3658,13 +4273,15 @@ function xlsx.open(path, opts)
     if not wbxml then error("xlsx: xl/workbook.xml manquant (pas un xlsx ?)", 0) end
     local relsxml = part("xl/_rels/workbook.xml.rels") or ""
     local ssxml = part("xl/sharedStrings.xml")
-    local shared = ssxml and parse_shared_strings(ssxml) or {}
-    local sheets, date1904, active_sheet, defined_names = parse_workbook(wbxml, relsxml)
+    local shared, rich_shared = {}, {}
+    if ssxml then shared, rich_shared = parse_shared_strings(ssxml) end
+    local sheets, date1904, active_sheet, defined_names, workbook_protection = parse_workbook(wbxml, relsxml)
     local datestyle, style_objects, dxf_objects = parse_styles(part("xl/styles.xml"))
     return setmetatable({
-      _data=data, _byname=byname, _shared=shared, _sheets=sheets,
+      _data=data, _byname=byname, _shared=shared, _rich_shared=rich_shared, _sheets=sheets,
       _cache={}, _datestyle=datestyle, _style_objects=style_objects, _dxf_objects=dxf_objects,
       _date1904=date1904, _limits=limits, _active_sheet=active_sheet, _defined_names=defined_names,
+      _workbook_protection=workbook_protection, _properties=parse_document_properties(part("docProps/core.xml"),part("docProps/app.xml")),
     }, ReadWB)
   end)
   if not ok then return nil, tostring(result) end

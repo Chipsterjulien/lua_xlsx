@@ -243,7 +243,7 @@ end
 -- ---- PRÉSENTATION ET FORMULES ----------------------------------------------
 print("\n[7] styles, dimensions, volets, filtres et formules")
 do
-  check(xlsx.VERSION == "1.4.0", "version du module 1.4.0")
+  check(xlsx.VERSION == "1.5.0", "version du module 1.5.0")
   local header = xlsx.style({
     bold = true,
     fill_color = "D9EAF7",
@@ -580,7 +580,7 @@ do
   expect_error(function() xlsx.new():add_sheet("x"):add_image_data("bad", "png", 0, 0) end,
     "image invalide refusée")
   expect_error(function()
-    local b=xlsx.new(); local x=b:add_sheet("x"); x:write_rows({{"A","B"},{1,2}}); x:add_chart({type="pie",categories="A2:A2",series={{values="B2:B2"}}})
+    local b=xlsx.new(); local x=b:add_sheet("x"); x:write_rows({{"A","B"},{1,2}}); x:add_chart({type="radar",categories="A2:A2",series={{values="B2:B2"}}})
   end, "type de graphique non pris en charge refusé")
   expect_error(function()
     local b=xlsx.new(); local x=b:add_sheet("x"); x:write_rows({{"A","A"},{1,2}}); x:add_table("A1:B2",{name="T"})
@@ -589,6 +589,151 @@ do
     "scale et ajustement simultanés refusés")
   expect_error(function() xlsx.new():add_sheet("x"):set_print_titles({ rows="2:1" }) end,
     "titres d'impression inversés refusés")
+end
+
+-- ---- FINITION ET VISUALISATION 1.5 ----------------------------------------
+print("\n[11] graphiques avancés, visualisation, protections et métadonnées")
+do
+  local alert = xlsx.style({ bold=true, font_color="9C0006", fill_color="FFC7CE" })
+  local input = xlsx.style({ fill_color="FFF2CC", locked=false })
+  local hidden_formula = xlsx.style({ hidden=true })
+
+  local wb = xlsx.new()
+  wb:set_properties({
+    title="Rapport 1.5", subject="Validation des nouveautés", creator="lua-xlsx",
+    description="Classeur de test", keywords={"lua", "xlsx", "test"},
+    category="Tests", company="lua-xlsx", manager="Julien",
+  })
+  wb:protect({ password="secret", structure=true })
+
+  local sh = wb:add_sheet("Synthèse")
+  sh:write_rows({
+    {"Mois", "Ventes", "Objectif", "Écart", "Tendance"},
+    {"Janvier", 12, 10, 2}, {"Février", 18, 15, 3},
+    {"Mars", 16, 17, -1}, {"Avril", 24, 20, 4},
+  })
+  sh:write(1, 1, 12, input)
+  sh:write(1, 3, xlsx.formula("=B2-C2", 2), hidden_formula)
+  sh:write_rich_text(6, 0, {
+    { text="Attention : ", bold=true, font_color="FF0000" },
+    { text="objectif non atteint", italic=true },
+  })
+  sh:protect({ password="feuille", select_unlocked_cells=true, auto_filter=true })
+  sh:add_row_page_break(4)
+  sh:add_column_page_break("D")
+  sh:add_sparkline("E2", "B2:D2", { type="line", color="4472C4", show_markers=true, show_high=true, show_low=true })
+  sh:add_sparkline("E3", "B3:D3", { type="column", color="70AD47", show_negative=true, negative_color="C00000" })
+  sh:add_sparkline("E4", "B4:D4", { type="win_loss", color="5B9BD5" })
+
+  sh:add_conditional_format("B2:B5", {
+    type="color_scale", min_color="F8696B", mid_type="percentile", mid_value=50,
+    mid_color="FFEB84", max_color="63BE7B",
+  })
+  sh:add_conditional_format("C2:C5", { type="data_bar", color="5B9BD5", show_value=true })
+  sh:add_conditional_format("D2:D5", {
+    type="icon_set", icons="3_traffic_lights", value_type="number", values={-1, 0, 3}, reverse=true,
+  })
+  sh:add_conditional_format("B2:B5", { type="top", rank=2, style=alert })
+  sh:add_conditional_format("D2:D5", { type="below_average", style=alert })
+
+  sh:add_chart({
+    type="pie", title="Répartition", categories="A2:A5",
+    series={{ name="Ventes", values="B2:B5", color="4472C4" }},
+    legend_position="bottom", data_labels={show_percent=true, position="best_fit"}, row=0, col=6,
+  })
+  sh:add_chart({
+    type="doughnut", title="Objectifs", categories="A2:A5",
+    series={{ name="Objectif", values="C2:C5" }}, hole_size=65, row=18, col=6,
+  })
+  sh:add_chart({
+    type="area", title="Évolution", categories="A2:A5", grouping="stacked",
+    series={{name="Ventes",values="B2:B5",color="4472C4"},{name="Objectif",values="C2:C5",color="ED7D31"}},
+    legend_position="top", x_axis={title="Mois"}, y_axis={title="Valeur",min=0,max=30,number_format="0",major_gridlines=true},
+    row=36, col=6,
+  })
+  sh:add_chart({
+    type="scatter", title="Ventes / objectif", x_values="C2:C5",
+    series={{name="Ventes",values="B2:B5",color="70AD47",marker="circle",line_width=2,smooth=true}},
+    legend=false, x_axis={title="Objectif",min=0,max=30}, y_axis={title="Ventes",min=0,max=30},
+    row=54, col=6,
+  })
+
+  assert(wb:save(TMP2, { use_babet=false }))
+  local read = assert(xlsx.open(TMP2, { use_babet=false }))
+  local props = read:get_properties()
+  check(props.title == "Rapport 1.5" and props.creator == "lua-xlsx"
+      and props.keywords == "lua, xlsx, test" and props.company == "lua-xlsx",
+    "propriétés du document relues")
+  local wp = read:get_protection()
+  check(wp and wp.structure == true and type(wp.password_hash) == "string",
+    "protection du classeur relue")
+
+  local rs = assert(read:sheet("Synthèse"))
+  local sp = rs:get_protection()
+  check(sp and sp.select_unlocked_cells == true and sp.auto_filter == true,
+    "protection de la feuille relue")
+  local input_opts = xlsx.style_options(assert(rs:get_style(1, 1)))
+  local formula_opts = xlsx.style_options(assert(rs:get_style(1, 3)))
+  check(input_opts.locked == false and formula_opts.hidden == true,
+    "protection des cellules relue")
+
+  local rich = rs:get_rich_text(6, 0)
+  local runs = rich and xlsx.rich_text_runs(rich) or {}
+  check(rs:read(6, 0) == "Attention : objectif non atteint" and xlsx.is_rich_text(rich)
+      and #runs == 2 and runs[1].bold == true and runs[1].font_color == "FFFF0000"
+      and runs[2].italic == true, "texte enrichi relu avec ses segments")
+
+  local rb, cb = rs:get_row_page_breaks(), rs:get_column_page_breaks()
+  check(#rb == 1 and rb[1] == 4 and #cb == 1 and cb[1] == 4,
+    "sauts de page relus")
+  local sparks = rs:get_sparklines()
+  check(#sparks == 3 and sparks[1].type == "line" and sparks[1].target == "E2"
+      and sparks[2].type == "column" and sparks[3].type == "win_loss",
+    "sparklines relues")
+
+  local cfs = rs:get_conditional_formats()
+  local found = {}
+  for _, cf in ipairs(cfs) do found[cf.type] = cf end
+  check(found.color_scale and found.color_scale.mid and found.color_scale.mid.value == 50
+      and found.data_bar and found.data_bar.color == "FF5B9BD5"
+      and found.icon_set and found.icon_set.icons == "3_traffic_lights"
+      and found.top and found.top.rank == 2 and found.below_average,
+    "formats conditionnels avancés relus")
+
+  local charts = rs:get_charts()
+  local by_type = {}; for _, chart in ipairs(charts) do by_type[chart.type] = chart end
+  check(#charts == 4 and by_type.pie and by_type.pie.legend_position == "bottom"
+      and by_type.pie.data_labels and by_type.pie.data_labels.show_percent == true
+      and by_type.doughnut and by_type.doughnut.hole_size == 65
+      and by_type.area and by_type.area.grouping == "stacked"
+      and by_type.area.x_axis.title == "Mois" and by_type.area.y_axis.max == 30
+      and by_type.scatter and by_type.scatter.series[1].x_values ~= nil
+      and by_type.scatter.series[1].line_width == 2 and by_type.scatter.series[1].smooth == true,
+    "graphiques avancés et options relus")
+
+  expect_error(function() xlsx.rich_text({{text=""}}) end,
+    "segment enrichi vide refusé")
+  expect_error(function() xlsx.rich_text({{text="x", shadow=true}}) end,
+    "option de texte enrichi inconnue refusée")
+  expect_error(function() xlsx.rich_text_runs("texte") end,
+    "rich_text_runs refuse une valeur ordinaire")
+  expect_error(function() xlsx.new():protect({password="1234567890123456"}) end,
+    "mot de passe classique trop long refusé")
+  expect_error(function() xlsx.new():add_sheet("x"):add_sparkline("A1", "B1:C1", {type="pie"}) end,
+    "type de sparkline inconnu refusé")
+  expect_error(function()
+    xlsx.new():add_sheet("x"):add_conditional_format("A1:A3", {
+      type="icon_set", icons="3_traffic_lights", values={0, 50},
+    })
+  end, "nombre de seuils d'icônes invalide refusé")
+  expect_error(function()
+    local b=xlsx.new(); local x=b:add_sheet("x"); x:write_rows({{"A","B","C"},{1,2,3}})
+    x:add_chart({type="line",categories="A2:A2",series={{values="B2:B2"}},y_axis={min=10,max=5}})
+  end, "bornes d'axe inversées refusées")
+  expect_error(function()
+    local b=xlsx.new(); local x=b:add_sheet("x"); x:write_rows({{"A","B","C"},{1,2,3}})
+    x:add_chart({type="pie",categories="A2:A2",series={{values="B2:B2"},{values="C2:C2"}}})
+  end, "graphique secteur à plusieurs séries refusé")
 end
 
 os.remove(TMP)

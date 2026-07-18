@@ -3,7 +3,7 @@
 Référence des modules `xlsx` et `dataframe`. La cible principale est Babet avec
 Lua 5.5, mais le cœur reste compatible avec Lua standard 5.3+.
 
-Documentation de lua-xlsx 1.4.0.
+Documentation de lua-xlsx 1.5.0.
 
 ## Table des matières
 
@@ -12,6 +12,7 @@ Documentation de lua-xlsx 1.4.0.
 - [Écriture XLSX](#écriture-xlsx)
 - [Styles, structure, mise en page, hyperliens et formules](#styles-structure-mise-en-page-hyperliens-et-formules)
 - [Rapports, graphiques, images et impression](#rapports-graphiques-images-et-impression)
+- [Finition, visualisation avancée et protection](#finition-visualisation-avancée-et-protection)
 - [Dates 1900 et 1904](#dates-1900-et-1904)
 - [Lecture XLSX](#lecture-xlsx)
 - [Limites et validation ZIP](#limites-et-validation-zip)
@@ -165,14 +166,14 @@ sh:write_rows({
 
 ## Styles, structure, mise en page, hyperliens et formules
 
-La version 1.4.0 écrit ces informations et expose également leur sous-ensemble
-pris en charge dans l'API de lecture. Les objets `style`, `formula` et
-`hyperlink` sont immuables.
+La version 1.5.0 écrit ces informations et expose également leur sous-ensemble
+pris en charge dans l'API de lecture. Les objets `style`, `formula`, `hyperlink`
+et `rich_text` sont immuables.
 
 ### `xlsx.VERSION`
 
 ```lua
-assert(xlsx.VERSION == "1.4.0")
+assert(xlsx.VERSION == "1.5.0")
 ```
 
 ### `xlsx.style([opts]) -> style`
@@ -194,6 +195,8 @@ par `write()` ou `set_style()`.
 | `vertical` | chaîne | `top`, `center`, `bottom`, `justify` |
 | `wrap_text` | booléen | retour automatique à la ligne |
 | `number_format` | chaîne | alias ou code de format Excel |
+| `locked` | booléen | cellule verrouillée lorsque la feuille est protégée |
+| `hidden` | booléen | formule masquée lorsque la feuille est protégée |
 | `border` | table | côtés `left`, `right`, `top`, `bottom` |
 
 Les couleurs RGB à six chiffres reçoivent automatiquement le canal alpha
@@ -582,10 +585,12 @@ déjà ajoutées.
 
 #### `sheet:add_conditional_format(range, opts) -> sheet`
 
-Le champ `style` est obligatoire et doit provenir de `xlsx.style()`. Pour les
-règles conditionnelles, seuls la police, le fond et les quatre bordures sont
-pris en charge. Les formats numériques et alignements sont refusés afin de ne
-pas promettre une conservation partielle.
+Pour les règles classiques (`cell`, `contains_text`, `blanks`, `not_blanks`,
+`duplicate` et `custom`), le champ `style` est obligatoire et doit provenir de
+`xlsx.style()`. Seuls la police, le fond et les quatre bordures sont pris en
+charge. Les règles visuelles de la 1.5.0 (`color_scale`, `data_bar` et
+`icon_set`) n'utilisent pas de `style` et sont détaillées dans le chapitre
+consacré à la visualisation avancée.
 
 Comparaison de cellule :
 
@@ -1273,6 +1278,608 @@ sh:set_print_titles({ rows = "1:1", columns = "A:A" })
 assert(wb:save("tableau-de-bord.xlsx"))
 ```
 
+## Finition, visualisation avancée et protection
+
+La version 1.5.0 complète les fonctions de rapport de la 1.4.0 avec des
+éléments visuels plus riches, des protections classiques XLSX, des
+métadonnées de document et du texte enrichi.
+
+### Texte enrichi dans une cellule
+
+#### `xlsx.rich_text(runs) -> rich_text`
+
+Crée une valeur composée de plusieurs segments. Chaque segment exige `text` et
+peut définir :
+
+- `bold` ;
+- `italic` ;
+- `underline` : `"single"` ou `"double"` ;
+- `strike` ;
+- `font_name` ;
+- `font_size` ;
+- `font_color`.
+
+```lua
+local warning = xlsx.rich_text({
+  { text = "Attention : ", bold = true, font_color = "FF0000" },
+  { text = "la date limite est vendredi.", italic = true },
+})
+
+sheet:write(0, 0, warning)
+```
+
+La méthode raccourcie évite de créer explicitement la valeur :
+
+```lua
+sheet:write_rich_text(1, 0, {
+  { text = "Total : ", bold = true },
+  { text = "1 250 €", font_color = "008000", underline = "single" },
+})
+```
+
+Un style de cellule complet peut être ajouté séparément :
+
+```lua
+sheet:write_rich_text(2, 0, {
+  { text = "État : ", bold = true },
+  { text = "validé", italic = true, font_color = "008000" },
+}, xlsx.style({ fill_color = "E2F0D9", wrap_text = true }))
+```
+
+#### `xlsx.is_rich_text(value)` et `xlsx.rich_text_runs(value)`
+
+`is_rich_text()` identifie une valeur enrichie. `rich_text_runs()` renvoie une
+copie indépendante de ses segments.
+
+```lua
+local rich = sheet:get_rich_text(0, 0)
+if rich and xlsx.is_rich_text(rich) then
+  for _, run in ipairs(xlsx.rich_text_runs(rich)) do
+    print(run.text, run.bold, run.italic, run.font_color)
+  end
+end
+```
+
+`sheet:read()` renvoie toujours le texte concaténé, ce qui conserve une lecture
+simple pour les programmes qui n'ont pas besoin des segments.
+
+### Mise en forme conditionnelle visuelle
+
+Les règles suivantes n'utilisent pas de `style` différentiel. Elles produisent
+les visualisations natives du tableur.
+
+#### Échelle de deux couleurs
+
+```lua
+sheet:add_conditional_format("B2:B100", {
+  type = "color_scale",
+  min_color = "F8696B",
+  max_color = "63BE7B",
+})
+```
+
+Les seuils par défaut sont `min` et `max`.
+
+#### Échelle de trois couleurs
+
+```lua
+sheet:add_conditional_format("B2:B100", {
+  type = "color_scale",
+  min_type = "number",
+  min_value = 0,
+  min_color = "F8696B",
+  mid_type = "percentile",
+  mid_value = 50,
+  mid_color = "FFEB84",
+  max_type = "number",
+  max_value = 100,
+  max_color = "63BE7B",
+})
+```
+
+Types de seuil disponibles : `min`, `max`, `number`, `percent`, `percentile`
+et `formula`. Les seuils `min` et `max` n'acceptent pas de valeur.
+
+#### Barre de données
+
+```lua
+sheet:add_conditional_format("C2:C100", {
+  type = "data_bar",
+  start_type = "min",
+  end_type = "max",
+  color = "5B9BD5",
+  show_value = true,
+})
+```
+
+Pour utiliser des bornes numériques :
+
+```lua
+sheet:add_conditional_format("C2:C100", {
+  type = "data_bar",
+  start_type = "number",
+  start_value = 0,
+  end_type = "number",
+  end_value = 500,
+  color = "70AD47",
+  show_value = false,
+})
+```
+
+#### Jeu d'icônes
+
+```lua
+sheet:add_conditional_format("D2:D100", {
+  type = "icon_set",
+  icons = "3_traffic_lights",
+  value_type = "number",
+  values = { 0, 50, 80 },
+  show_value = true,
+  reverse = false,
+})
+```
+
+Jeux pris en charge :
+
+- `3_arrows`, `3_arrows_gray`, `3_flags` ;
+- `3_traffic_lights`, `3_traffic_lights_rimmed` ;
+- `3_signs`, `3_symbols`, `3_symbols_circled` ;
+- `4_arrows`, `4_arrows_gray`, `4_ratings`, `4_traffic_lights` ;
+- `5_arrows`, `5_arrows_gray`, `5_ratings`, `5_quarters`.
+
+Le nombre de seuils doit correspondre au nombre indiqué par le nom du jeu.
+
+#### Premiers, derniers et moyenne
+
+```lua
+local highlight = xlsx.style({
+  bold = true,
+  font_color = "006100",
+  fill_color = "C6EFCE",
+})
+
+sheet:add_conditional_format("B2:B100", {
+  type = "top",
+  rank = 10,
+  percent = false,
+  style = highlight,
+})
+
+sheet:add_conditional_format("C2:C100", {
+  type = "bottom",
+  rank = 5,
+  percent = true,
+  style = xlsx.style({ fill_color = "FFC7CE" }),
+})
+
+sheet:add_conditional_format("D2:D100", {
+  type = "above_average",
+  style = highlight,
+})
+
+sheet:add_conditional_format("E2:E100", {
+  type = "below_average",
+  style = xlsx.style({ font_color = "9C0006" }),
+})
+```
+
+### Sparklines
+
+#### `sheet:add_sparkline(target, source [, opts]) -> sheet`
+
+Ajoute un mini-graphique dans une cellule. La cible doit être une seule cellule
+et la source une plage de la même feuille.
+
+Sparkline en courbe :
+
+```lua
+sheet:add_sparkline("N2", "B2:M2", {
+  type = "line",
+  color = "4472C4",
+  show_markers = true,
+  show_high = true,
+  show_low = true,
+  high_color = "00B050",
+  low_color = "C00000",
+})
+```
+
+Sparkline en colonnes :
+
+```lua
+sheet:add_sparkline("N3", "B3:M3", {
+  type = "column",
+  color = "5B9BD5",
+  show_negative = true,
+  negative_color = "C00000",
+  show_first = true,
+  show_last = true,
+})
+```
+
+Sparkline gains et pertes :
+
+```lua
+sheet:add_sparkline("N4", "B4:M4", {
+  type = "win_loss",
+  color = "70AD47",
+  right_to_left = false,
+})
+```
+
+Options disponibles : `type`, `color`, `negative_color`, `high_color`,
+`low_color`, `first_color`, `last_color`, `show_markers`, `show_high`,
+`show_low`, `show_first`, `show_last`, `show_negative` et `right_to_left`.
+
+```lua
+sheet:remove_sparkline("N3")
+local sparklines = sheet:get_sparklines()
+```
+
+Les sparklines utilisent l'extension OOXML `x14`. Excel et LibreOffice la
+comprennent. `openpyxl 3.1.5` avertit qu'il ne la prend pas en charge et la
+supprime lorsqu'il réenregistre le classeur.
+
+### Graphiques avancés
+
+`sheet:add_chart()` accepte désormais :
+
+- `line` ;
+- `column` ;
+- `bar` ;
+- `pie` ;
+- `doughnut` ;
+- `area` ;
+- `scatter`.
+
+#### Secteur
+
+```lua
+sheet:add_chart({
+  type = "pie",
+  title = "Répartition des ventes",
+  categories = "A2:A6",
+  series = {
+    { name = "Ventes", values = "B2:B6" },
+  },
+  legend_position = "bottom",
+  data_labels = {
+    show_percent = true,
+    show_category = true,
+    position = "best_fit",
+  },
+  row = 1,
+  col = 4,
+})
+```
+
+Un graphique `pie` ou `doughnut` exige exactement une série.
+
+#### Anneau
+
+```lua
+sheet:add_chart({
+  type = "doughnut",
+  title = "Répartition",
+  categories = "A2:A6",
+  series = {
+    { name_ref = "B1", values = "B2:B6" },
+  },
+  hole_size = 65,
+  legend_position = "right",
+  row = 18,
+  col = 4,
+})
+```
+
+`hole_size` accepte une valeur de 10 à 90.
+
+#### Aire empilée
+
+```lua
+sheet:add_chart({
+  type = "area",
+  title = "Évolution cumulée",
+  categories = "A2:A13",
+  grouping = "stacked",
+  series = {
+    { name = "Produit A", values = "B2:B13", color = "4472C4" },
+    { name = "Produit B", values = "C2:C13", color = "ED7D31" },
+  },
+  x_axis = { title = "Mois" },
+  y_axis = {
+    title = "Ventes",
+    min = 0,
+    max = 10000,
+    number_format = '#,##0 "€"',
+    major_gridlines = true,
+  },
+  legend_position = "top",
+  row = 35,
+  col = 4,
+})
+```
+
+`grouping` accepte `standard`, `stacked` et `percent_stacked` pour les courbes,
+aires, colonnes et barres.
+
+#### Nuage de points
+
+```lua
+sheet:add_chart({
+  type = "scatter",
+  title = "Température et consommation",
+  x_values = "A2:A50",
+  series = {
+    {
+      name = "Consommation",
+      values = "B2:B50",
+      color = "70AD47",
+      marker = "circle",
+      line_width = 2,
+      smooth = true,
+    },
+  },
+  x_axis = { title = "Température", min = -10, max = 40 },
+  y_axis = { title = "kWh", min = 0, major_gridlines = true },
+  legend = false,
+  row = 52,
+  col = 4,
+})
+```
+
+Chaque série d'un `scatter` peut fournir son propre `x_values`. À défaut,
+`x_values` est repris au niveau du graphique.
+
+#### Options communes
+
+Positions de légende : `right`, `left`, `top`, `bottom`, `top_right`.
+
+Options de série :
+
+- `name` ou `name_ref` ;
+- `values` ;
+- `x_values` pour un nuage de points ;
+- `color` ;
+- `marker` ;
+- `line_width`, de 0,25 à 20 points ;
+- `smooth`.
+
+Marqueurs : `none`, `circle`, `dash`, `diamond`, `dot`, `picture`, `plus`,
+`square`, `star`, `triangle`, `x`.
+
+Les étiquettes de données acceptent `show_value`, `show_percent`,
+`show_category`, `show_series_name` et `position`. Positions : `center`,
+`inside_end`, `inside_base`, `outside_end`, `best_fit`, `left`, `right`, `top`,
+`bottom`.
+
+Les axes acceptent `title`, `min`, `max`, `number_format` et
+`major_gridlines`. Le minimum doit être strictement inférieur au maximum.
+
+### Protection des cellules
+
+Les options `locked` et `hidden` font partie de `xlsx.style()` :
+
+```lua
+local input_cell = xlsx.style({
+  fill_color = "FFF2CC",
+  locked = false,
+})
+
+local protected_formula = xlsx.style({
+  number_format = "0.00",
+  locked = true,
+  hidden = true,
+})
+
+sheet:write(1, 1, 12.5, input_cell)
+sheet:write(1, 2, xlsx.formula("=B2*1.2", 15), protected_formula)
+```
+
+Ces attributs ne prennent effet que lorsque la feuille est protégée.
+
+### Protection d'une feuille
+
+#### `sheet:protect([opts | false]) -> sheet`
+
+```lua
+sheet:protect({
+  password = "secret",
+  select_locked_cells = false,
+  select_unlocked_cells = true,
+  format_cells = false,
+  format_columns = false,
+  format_rows = false,
+  insert_columns = false,
+  insert_rows = false,
+  insert_hyperlinks = false,
+  delete_columns = false,
+  delete_rows = false,
+  sort = false,
+  auto_filter = true,
+  pivot_tables = false,
+  objects = false,
+  scenarios = false,
+})
+```
+
+Chaque option est booléenne. `sheet:protect(false)` retire la protection.
+
+```lua
+local protection = sheet:get_protection()
+print(protection and protection.password_hash)
+```
+
+### Protection de la structure du classeur
+
+#### `workbook:protect([opts | false]) -> workbook`
+
+```lua
+workbook:protect({
+  password = "secret",
+  structure = true,
+  windows = false,
+})
+```
+
+`structure` empêche les modifications ordinaires de la structure des feuilles.
+`windows` protège les fenêtres du classeur dans les logiciels qui gèrent cette
+option.
+
+```lua
+workbook:protect(false)
+local protection = workbook:get_protection()
+```
+
+La protection historique XLSX n'est **pas un chiffrement**. Le mot de passe est
+transformé en un hash ancien et limité à 15 octets. Elle évite surtout les
+modifications accidentelles.
+
+### Sauts de page manuels
+
+```lua
+sheet:add_row_page_break(40)
+sheet:add_row_page_break(80)
+sheet:add_column_page_break("H")
+sheet:add_column_page_break(12)
+```
+
+Les lignes et colonnes sont ici **1-based**, comme dans le fichier XLSX. Une
+colonne peut être donnée par ses lettres ou par son numéro.
+
+```lua
+local rows = sheet:get_row_page_breaks()
+local columns = sheet:get_column_page_breaks()
+
+sheet:clear_page_breaks()
+```
+
+### Propriétés du document
+
+#### `workbook:set_properties(opts) -> workbook`
+
+```lua
+workbook:set_properties({
+  title = "Rapport annuel",
+  subject = "Résultats 2026",
+  creator = "Julien Freyermuth",
+  description = "Rapport généré avec lua-xlsx",
+  keywords = { "rapport", "ventes", "2026" },
+  category = "Reporting",
+  company = "Mon entreprise",
+  manager = "Responsable du service",
+})
+```
+
+`keywords` accepte une chaîne ou une liste dense de chaînes. Les propriétés
+principales sont écrites dans `docProps/core.xml`, et `company`/`manager` dans
+`docProps/app.xml`.
+
+```lua
+local properties = workbook:get_properties()
+print(properties.title, properties.creator, properties.company)
+
+workbook:set_properties(false)
+```
+
+### Lecture des informations 1.5
+
+Les objets ouverts par `xlsx.open()` exposent :
+
+```lua
+local properties = workbook:get_properties()
+local workbook_protection = workbook:get_protection()
+
+local rich = sheet:get_rich_text(row, col)
+local sheet_protection = sheet:get_protection()
+local row_breaks = sheet:get_row_page_breaks()
+local column_breaks = sheet:get_column_page_breaks()
+local sparklines = sheet:get_sparklines()
+local rules = sheet:get_conditional_formats()
+local charts = sheet:get_charts()
+```
+
+`get_charts()` restitue notamment le type, les références de séries, le
+regroupement, la légende, les étiquettes de données, les principaux réglages
+d'axes, les couleurs, les marqueurs et l'épaisseur de ligne pris en charge.
+
+### Exemple combiné 1.5.0
+
+```lua
+local xlsx = require("xlsx")
+
+local wb = xlsx.new()
+wb:set_properties({
+  title = "Tableau de bord 2026",
+  creator = "lua-xlsx",
+  company = "Mon entreprise",
+})
+wb:protect({ password = "structure", structure = true })
+
+local sh = wb:add_sheet("Tableau de bord")
+sh:write_rows({
+  { "Mois", "Ventes", "Objectif", "Écart", "Tendance" },
+  { "Janvier", 120, 100, 20 },
+  { "Février", 90, 110, -20 },
+  { "Mars", 145, 130, 15 },
+})
+
+sh:write_rich_text(5, 0, {
+  { text = "Légende : ", bold = true },
+  { text = "vert = objectif atteint", font_color = "008000" },
+})
+
+sh:add_conditional_format("B2:B4", {
+  type = "color_scale",
+  min_color = "F8696B",
+  mid_type = "percentile",
+  mid_value = 50,
+  mid_color = "FFEB84",
+  max_color = "63BE7B",
+})
+
+sh:add_conditional_format("D2:D4", {
+  type = "icon_set",
+  icons = "3_traffic_lights",
+  value_type = "number",
+  values = { -10, 0, 10 },
+})
+
+for row = 2, 4 do
+  sh:add_sparkline("E" .. row, "B" .. row .. ":D" .. row, {
+    type = "line",
+    color = "4472C4",
+    show_high = true,
+    show_low = true,
+  })
+end
+
+sh:add_chart({
+  type = "area",
+  title = "Ventes et objectifs",
+  categories = "A2:A4",
+  series = {
+    { name_ref = "B1", values = "B2:B4", color = "4472C4" },
+    { name_ref = "C1", values = "C2:C4", color = "ED7D31" },
+  },
+  grouping = "standard",
+  legend_position = "bottom",
+  x_axis = { title = "Mois" },
+  y_axis = { title = "Valeur", min = 0 },
+  row = 0,
+  col = 6,
+})
+
+sh:write(1, 1, 120, xlsx.style({ locked = false, fill_color = "FFF2CC" }))
+sh:protect({ password = "saisie", select_unlocked_cells = true })
+sh:add_row_page_break(40)
+sh:set_print_area("A1:M40")
+
+assert(wb:save("tableau-de-bord.xlsx"))
+```
+
+---
+
 ## Dates 1900 et 1904
 
 ### `xlsx.date(year, month, day)`
@@ -1883,11 +2490,12 @@ temporaire et ne laisse pas les fichiers auxiliaires LaTeX dans le projet.
 
 - Écriture ZIP STORED uniquement ; lecture STORED et DEFLATE.
 - Pas de ZIP64 dans le parseur Lua interne.
-- Pas de tableaux croisés dynamiques, macros XLSM, graphiques combinés,
-  graphiques circulaires, images SVG ou mise en page avancée par zones multiples.
-- La mise en forme conditionnelle se limite aux règles simples documentées ;
-  les barres de données, jeux d’icônes et échelles de couleurs ne sont pas pris
-  en charge.
+- Pas de tableaux croisés dynamiques, macros XLSM, graphiques combinés ou 3D,
+  axe secondaire, images SVG ou mise en page avancée par zones multiples.
+- Les sparklines utilisent l'extension OOXML `x14`. Excel et LibreOffice la
+  conservent, mais `openpyxl 3.1.5` la supprime lorsqu'il réenregistre le fichier.
+- La protection classique XLSX ne chiffre pas le classeur et limite le mot de
+  passe à 15 octets.
 - Les commentaires sont lus et écrits comme du texte simple : les fragments
   riches, dimensions et positions personnalisées ne sont pas conservés.
 - Les formules sont lues et écrites mais ne sont pas calculées. Les formules
