@@ -14,15 +14,25 @@
 -- along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 --- xlsx.lua — lecture/écriture de fichiers .xlsx en Lua pur.
---- Cible : LuaPilot (Lua 5.5). Compatible Lua 5.3+.
---- v1 : ÉCRITURE seulement. Aucune dépendance externe (pas de unzip, pas de C).
+--- Cible principale : Babet (Lua 5.5). Compatible avec Lua standard 5.3+.
 ---
---- Un .xlsx est une archive ZIP de fichiers XML. Ici on construit les XML
---- à la main et on les empaquette en ZIP STORED (non compressé) — Excel et
---- LibreOffice lisent ça parfaitement. Le seul morceau "binaire" est le CRC32
---- exigé par le format ZIP, implémenté en Lua pur ci-dessous.
+--- Le cœur XLSX reste autonome. Lorsque la globale `babet` est disponible,
+--- le module utilise automatiquement ses primitives de CRC-32, de validation
+--- d'archive et d'écriture atomique. Sans Babet, un chemin de repli Lua pur
+--- conserve l'API et applique ses propres contrôles de taille, CRC et ZIP.
 
 local xlsx = {}
+
+local function get_babet()
+  local runtime = rawget(_G, "babet")
+  return type(runtime) == "table" and runtime or nil
+end
+
+local function babet_function(name)
+  local runtime = get_babet()
+  local fn = runtime and runtime[name]
+  return type(fn) == "function" and fn or nil
+end
 
 -- ----------------------------------------------------------------------------
 -- CRC32 (table-based, polynôme ZIP standard 0xEDB88320)
@@ -44,6 +54,13 @@ local function init_crc()
 end
 
 local function crc32(s)
+  local native = babet_function("crc32")
+  if native then
+    local ok, digest = pcall(native, s)
+    if ok and type(digest) == "string" and digest:match("^%x%x%x%x%x%x%x%x$") then
+      return assert(tonumber(digest, 16))
+    end
+  end
   if not crc_table then init_crc() end
   local crc = 0xFFFFFFFF
   for i = 1, #s do
@@ -56,7 +73,34 @@ end
 -- Helpers XML / colonnes / nombres
 -- ----------------------------------------------------------------------------
 local XML_ESC = { ["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;", ['"'] = "&quot;" }
+
+local function is_xml_codepoint(cp)
+  return cp == 0x09 or cp == 0x0A or cp == 0x0D
+    or (cp >= 0x20 and cp <= 0xD7FF)
+    or (cp >= 0xE000 and cp <= 0xFFFD)
+    or (cp >= 0x10000 and cp <= 0x10FFFF)
+end
+
+local function validate_xml_text(s, what, level)
+  local count, bad = utf8.len(s)
+  if not count then
+    error("xlsx: " .. what .. " n'est pas une chaîne UTF-8 valide (octet " .. bad .. ")", level or 3)
+  end
+  for _, cp in utf8.codes(s) do
+    if not is_xml_codepoint(cp) then
+      error(string.format("xlsx: %s contient un caractère interdit par XML 1.0 (U+%04X)", what, cp), level or 3)
+    end
+  end
+  return count
+end
+
+local function validate_xml_document(s, what)
+  validate_xml_text(s, what or "document XML", 0)
+  return s
+end
+
 local function esc(s)
+  validate_xml_text(s, "texte de cellule", 3)
   return (s:gsub('[&<>"]', XML_ESC))
 end
 
@@ -113,50 +157,86 @@ local function civil_from_days(z)
   return y, m, d
 end
 
-local EXCEL_EPOCH = days_from_civil(1899, 12, 30) -- = -25569
+local EXCEL_EPOCH_1900 = days_from_civil(1899, 12, 30)
+local EXCEL_EPOCH_1904 = days_from_civil(1904, 1, 1)
 
-local function ymd_to_serial(y, m, d, h, mi, s)
-  local days = days_from_civil(y, m, d) - EXCEL_EPOCH
-  return days + (h * 3600 + mi * 60 + s) / 86400
+local function epoch_for(date1904)
+  return date1904 and EXCEL_EPOCH_1904 or EXCEL_EPOCH_1900
 end
 
--- numéro de série Excel -> chaîne ISO 8601 (cohérent avec luapilot.toml)
-local function serial_to_iso(serial, withtime)
+local function is_leap_year(y)
+  return y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0)
+end
+
+local function validate_date_parts(y, m, d, h, mi, sec, level)
+  local values = { y, m, d, h, mi, sec }
+  local names = { "année", "mois", "jour", "heure", "minute", "seconde" }
+  for i = 1, 6 do
+    if math.type(values[i]) ~= "integer" then
+      error("xlsx: " .. names[i] .. " doit être un entier", level or 3)
+    end
+  end
+  if y < 1 or y > 9999 then error("xlsx: année hors plage (1..9999)", level or 3) end
+  if m < 1 or m > 12 then error("xlsx: mois hors plage (1..12)", level or 3) end
+  local mdays = { 31, is_leap_year(y) and 29 or 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+  if d < 1 or d > mdays[m] then error("xlsx: jour invalide pour ce mois", level or 3) end
+  if h < 0 or h > 23 then error("xlsx: heure hors plage (0..23)", level or 3) end
+  if mi < 0 or mi > 59 then error("xlsx: minute hors plage (0..59)", level or 3) end
+  if sec < 0 or sec > 59 then error("xlsx: seconde hors plage (0..59)", level or 3) end
+end
+
+local function ymd_to_serial(y, m, d, h, mi, sec, date1904)
+  local days = days_from_civil(y, m, d) - epoch_for(date1904)
+  return days + (h * 3600 + mi * 60 + sec) / 86400
+end
+
+-- numéro de série Excel -> chaîne ISO 8601
+local function serial_to_iso(serial, withtime, date1904)
+  if type(serial) ~= "number" or serial ~= serial or serial == math.huge or serial == -math.huge then
+    error("xlsx: serial_to_iso attend un nombre fini", 2)
+  end
   local whole = math.floor(serial)
   local frac = serial - whole
   if not withtime then
-    local y, m, d = civil_from_days(whole + EXCEL_EPOCH)
+    local y, m, d = civil_from_days(whole + epoch_for(date1904))
     return string.format("%04d-%02d-%02d", y, m, d)
   end
   local secs = math.floor(frac * 86400 + 0.5)
   if secs >= 86400 then secs = secs - 86400; whole = whole + 1 end
-  local y, m, d = civil_from_days(whole + EXCEL_EPOCH)
+  local y, m, d = civil_from_days(whole + epoch_for(date1904))
   return string.format("%04d-%02d-%02dT%02d:%02d:%02d",
     y, m, d, secs // 3600, (secs % 3600) // 60, secs % 60)
 end
 
--- valeur "date" tagguée, reconnue par Sheet:write
 local DATE_MT = {}
+
+local function make_date(kind, y, m, d, h, mi, sec, level)
+  validate_date_parts(y, m, d, h, mi, sec, level)
+  return setmetatable({
+    serial = ymd_to_serial(y, m, d, h, mi, sec, false),
+    kind = kind, y = y, m = m, d = d, h = h, mi = mi, s = sec,
+  }, DATE_MT)
+end
 
 --- Crée une valeur date (affichée yyyy-mm-dd dans Excel).
 function xlsx.date(y, m, d)
-  if math.type(y) ~= "integer" or math.type(m) ~= "integer" or math.type(d) ~= "integer" then
-    error("xlsx.date attend des entiers (année, mois, jour)", 2)
-  end
-  return setmetatable({ serial = ymd_to_serial(y, m, d, 0, 0, 0), kind = "date" }, DATE_MT)
+  return make_date("date", y, m, d, 0, 0, 0, 3)
 end
 
 --- Crée une valeur date-heure (affichée yyyy-mm-dd hh:mm:ss dans Excel).
-function xlsx.datetime(y, m, d, h, mi, s)
-  return setmetatable(
-    { serial = ymd_to_serial(y, m, d, h or 0, mi or 0, s or 0), kind = "datetime" },
-    DATE_MT)
+function xlsx.datetime(y, m, d, h, mi, sec)
+  h, mi, sec = h or 0, mi or 0, sec or 0
+  return make_date("datetime", y, m, d, h, mi, sec, 3)
 end
 
--- exposés pour conversions manuelles
 xlsx.serial_to_iso = serial_to_iso
-function xlsx.date_to_serial(y, m, d, h, mi, s)
-  return ymd_to_serial(y, m, d, h or 0, mi or 0, s or 0)
+function xlsx.date_to_serial(y, m, d, h, mi, sec, date1904)
+  h, mi, sec = h or 0, mi or 0, sec or 0
+  validate_date_parts(y, m, d, h, mi, sec, 3)
+  if date1904 ~= nil and type(date1904) ~= "boolean" then
+    error("xlsx: date1904 doit être un booléen", 2)
+  end
+  return ymd_to_serial(y, m, d, h, mi, sec, date1904)
 end
 
 -- ----------------------------------------------------------------------------
@@ -165,18 +245,22 @@ end
 local Sheet = {}
 Sheet.__index = Sheet
 
-local function new_sheet(name)
+local function new_sheet(name, workbook)
   return setmetatable({
     name   = name,
     cells  = {},   -- cells[row][col] = valeur Lua brute
     maxrow = -1,
     maxcol = -1,
+    _workbook = workbook,
   }, Sheet)
 end
 
+local MAX_ROW = 1048575
+local MAX_COL = 16383
 local function check_index(v, what, level)
-  if math.type(v) ~= "integer" or v < 0 then
-    error("xlsx: " .. what .. " doit être un entier >= 0", level)
+  local max = what == "row" and MAX_ROW or MAX_COL
+  if math.type(v) ~= "integer" or v < 0 or v > max then
+    error("xlsx: " .. what .. " doit être un entier entre 0 et " .. max, level)
   end
 end
 
@@ -189,6 +273,8 @@ function Sheet:write(row, col, value)
     -- valeur date : acceptée telle quelle
   elseif value ~= nil and t ~= "string" and t ~= "number" and t ~= "boolean" then
     error("xlsx: type de cellule non supporté : " .. t, 2)
+  elseif t == "string" then
+    validate_xml_text(value, "texte de cellule", 3)
   end
   if t == "number" and (value ~= value or value == math.huge or value == -math.huge) then
     error("xlsx: impossible d'écrire NaN/Inf dans une cellule", 2)
@@ -251,8 +337,10 @@ function Sheet:_xml(sst, sst_index)
           local tv = type(v)
           if tv == "table" then -- valeur date taggée
             local style = (v.kind == "datetime") and 2 or 1
+            local date1904 = self._workbook and self._workbook._date1904 or false
+            local serial = ymd_to_serial(v.y, v.m, v.d, v.h, v.mi, v.s, date1904)
             b[#b + 1] = '<c r="' .. ref .. '" s="' .. style .. '"><v>' ..
-              num2str(v.serial) .. '</v></c>'
+              num2str(serial) .. '</v></c>'
           elseif tv == "string" then
             local idx = sst_index[v]
             if not idx then
@@ -281,25 +369,35 @@ end
 local Workbook = {}
 Workbook.__index = Workbook
 
-function xlsx.new()
-  return setmetatable({ sheets = {} }, Workbook)
+function xlsx.new(opts)
+  opts = opts or {}
+  if type(opts) ~= "table" then error("xlsx: new attend une table d'options", 2) end
+  for k in pairs(opts) do
+    if k ~= "date_system" then error("xlsx: option inconnue pour new : " .. tostring(k), 2) end
+  end
+  local date_system = opts.date_system or "1900"
+  if date_system ~= "1900" and date_system ~= "1904" then
+    error("xlsx: date_system doit valoir '1900' ou '1904'", 2)
+  end
+  return setmetatable({ sheets = {}, _date1904 = date_system == "1904", _sheet_names = {} }, Workbook)
 end
 
 function Workbook:add_sheet(name)
-  if name == nil then
-    name = "Sheet" .. (#self.sheets + 1)
-  end
-  if type(name) ~= "string" then
-    error("xlsx: le nom de feuille doit être une string", 2)
-  end
-  if #name == 0 or #name > 31 then
-    error("xlsx: nom de feuille invalide (1 à 31 caractères)", 2)
-  end
+  if name == nil then name = "Sheet" .. (#self.sheets + 1) end
+  if type(name) ~= "string" then error("xlsx: le nom de feuille doit être une string", 2) end
+  local count = validate_xml_text(name, "nom de feuille", 3)
+  if count == 0 or count > 31 then error("xlsx: nom de feuille invalide (1 à 31 caractères Unicode)", 2) end
   if name:find('[:\\/?*%[%]]') then
     error("xlsx: le nom de feuille contient un caractère interdit ( : \\ / ? * [ ] )", 2)
   end
-  local sh = new_sheet(name)
+  if name:sub(1, 1) == "'" or name:sub(-1) == "'" then
+    error("xlsx: le nom de feuille ne peut pas commencer ou finir par une apostrophe", 2)
+  end
+  local key = name:lower()
+  if self._sheet_names[key] then error("xlsx: nom de feuille dupliqué : " .. name, 2) end
+  local sh = new_sheet(name, self)
   self.sheets[#self.sheets + 1] = sh
+  self._sheet_names[key] = true
   return sh
 end
 
@@ -346,6 +444,7 @@ function Workbook:_parts()
     local t = {}
     t[#t + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     t[#t + 1] = '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+    if self._date1904 then t[#t + 1] = '<workbookPr date1904="1"/>' end
     t[#t + 1] = '<sheets>'
     for i = 1, nsheets do
       t[#t + 1] = '<sheet name="' .. esc(self.sheets[i].name) ..
@@ -456,21 +555,74 @@ local function build_zip(parts)
   return table.concat(out)
 end
 
---- Écrit le classeur dans `path`. Renvoie true, ou (nil, err) en cas d'échec I/O.
-function Workbook:save(path)
-  if type(path) ~= "string" then
-    error("xlsx: le chemin de sauvegarde doit être une string", 2)
+local temp_counter = 0
+
+local function write_all(file, bytes)
+  local ok, err = file:write(bytes)
+  if not ok then return nil, err or "écriture incomplète" end
+  local flushed, flush_err = file:flush()
+  if not flushed then return nil, flush_err or "échec de flush" end
+  return true
+end
+
+local function fallback_atomic_write(path, bytes, overwrite)
+  if not overwrite then
+    local existing = io.open(path, "rb")
+    if existing then existing:close(); return nil, "destination existante" end
   end
+  temp_counter = temp_counter + 1
+  local tmp = string.format("%s.xlsx-tmp-%d-%d-%d", path, os.time(), temp_counter, math.random(0, 0x7fffffff))
+  local f, err = io.open(tmp, "wb")
+  if not f then return nil, "impossible de créer le temporaire : " .. tostring(err) end
+  local ok, write_err = write_all(f, bytes)
+  local closed, close_err = f:close()
+  if not ok or not closed then
+    os.remove(tmp)
+    return nil, tostring(write_err or close_err or "échec de fermeture")
+  end
+  local renamed, rename_err = os.rename(tmp, path)
+  if not renamed then
+    os.remove(tmp)
+    return nil, "publication atomique impossible : " .. tostring(rename_err)
+  end
+  return true
+end
+
+--- Écrit le classeur dans `path`.
+--- opts : overwrite=true, durable=true, permissions=0644, use_babet=true.
+function Workbook:save(path, opts)
+  if type(path) ~= "string" then error("xlsx: le chemin de sauvegarde doit être une string", 2) end
+  opts = opts or {}
+  if type(opts) ~= "table" then error("xlsx: save attend une table d'options", 2) end
+  local allowed = { overwrite=true, durable=true, permissions=true, use_babet=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option inconnue pour save : " .. tostring(k), 2) end end
+  local overwrite = opts.overwrite
+  if overwrite == nil then overwrite = true elseif type(overwrite) ~= "boolean" then error("xlsx: overwrite doit être un booléen", 2) end
+  local durable = opts.durable
+  if durable == nil then durable = true elseif type(durable) ~= "boolean" then error("xlsx: durable doit être un booléen", 2) end
+  local permissions = opts.permissions or tonumber("644", 8)
+  if math.type(permissions) ~= "integer" or permissions < 0 or permissions > tonumber("777", 8) then
+    error("xlsx: permissions doit être un entier entre 0000 et 0777", 2)
+  end
+  local use_babet = opts.use_babet
+  if use_babet == nil then use_babet = true elseif type(use_babet) ~= "boolean" then error("xlsx: use_babet doit être un booléen", 2) end
   if #self.sheets == 0 then self:add_sheet("Sheet1") end
 
-  local bytes = build_zip(self:_parts())
+  local ok_build, bytes = pcall(function() return build_zip(self:_parts()) end)
+  if not ok_build then return nil, tostring(bytes) end
 
-  local f, err = io.open(path, "wb")
-  if not f then
-    return nil, "xlsx: impossible d'ouvrir '" .. path .. "' : " .. tostring(err)
+  local native = use_babet and babet_function("writeFileAtomic") or nil
+  if native then
+    local ok_call, ok, err = pcall(native, path, bytes, {
+      overwrite = overwrite, permissions = permissions, durable = durable,
+    })
+    if not ok_call then return nil, "xlsx: writeFileAtomic a levé une erreur : " .. tostring(ok) end
+    if not ok then return nil, "xlsx: " .. tostring(err) end
+    return true
   end
-  f:write(bytes)
-  f:close()
+
+  local ok, err = fallback_atomic_write(path, bytes, overwrite)
+  if not ok then return nil, "xlsx: impossible d'écrire '" .. path .. "' : " .. tostring(err) end
   return true
 end
 
@@ -480,10 +632,16 @@ end
 --- Écrit une matrice directement dans un fichier. opts.sheet = nom de feuille.
 function xlsx.write_rows(path, matrix, opts)
   opts = opts or {}
-  local wb = xlsx.new()
+  if type(opts) ~= "table" then error("xlsx: write_rows attend une table d'options", 2) end
+  local allowed = { sheet=true, date_system=true, overwrite=true, durable=true, permissions=true, use_babet=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option inconnue pour write_rows : " .. tostring(k), 2) end end
+  local wb = xlsx.new({ date_system = opts.date_system or "1900" })
   local sh = wb:add_sheet(opts.sheet or "Sheet1")
   sh:write_rows(matrix)
-  return wb:save(path)
+  return wb:save(path, {
+    overwrite = opts.overwrite, durable = opts.durable,
+    permissions = opts.permissions, use_babet = opts.use_babet,
+  })
 end
 
 -- ============================================================================
@@ -527,7 +685,7 @@ local function huff_build(lengths, num)
   return counts, symbols
 end
 
-local function inflate(input)
+local function inflate(input, max_output)
   local byte = string.byte
   local n = #input
   local pos = 1
@@ -546,15 +704,12 @@ local function inflate(input)
     return v
   end
 
-  -- décode un symbole (algorithme "puff")
   local function decode(counts, symbols)
     local code, first, index = 0, 0, 0
     for len = 1, 15 do
       code = code | getbits(1)
       local count = counts[len]
-      if code - count < first then
-        return symbols[index + (code - first)]
-      end
+      if code - count < first then return symbols[index + (code - first)] end
       index = index + count
       first = (first + count) << 1
       code = code << 1
@@ -563,54 +718,53 @@ local function inflate(input)
   end
 
   local out, olen = {}, 0
+  local function reserve(count)
+    if count < 0 or olen + count > max_output then
+      error("xlsx: entrée décompressée trop volumineuse", 0)
+    end
+  end
 
   local function inflate_block(lc, ls, dc, ds)
     while true do
       local sym = decode(lc, ls)
+      if sym == nil then error("xlsx: inflate: symbole absent", 0) end
       if sym == 256 then return end
       if sym < 256 then
-        olen = olen + 1
-        out[olen] = sym
+        reserve(1); olen = olen + 1; out[olen] = sym
       else
+        if sym < 257 or sym > 285 then error("xlsx: inflate: longueur invalide", 0) end
         local li = sym - 256
         local length = LEN_BASE[li] + getbits(LEN_EXTRA[li])
         local dsym = decode(dc, ds)
+        if dsym == nil or dsym < 0 or dsym > 29 then error("xlsx: inflate: distance invalide", 0) end
         local distance = DIST_BASE[dsym + 1] + getbits(DIST_EXTRA[dsym + 1])
+        if distance < 1 or distance > olen then error("xlsx: inflate: référence arrière invalide", 0) end
+        reserve(length)
         local start = olen - distance
-        for k = 1, length do
-          olen = olen + 1
-          out[olen] = out[start + k]
-        end
+        for k = 1, length do olen = olen + 1; out[olen] = out[start + k] end
       end
     end
   end
 
-  -- tables Huffman fixes (construites une fois par appel)
   local fixed_lit = {}
-  for s = 0, 143 do fixed_lit[s] = 8 end
-  for s = 144, 255 do fixed_lit[s] = 9 end
-  for s = 256, 279 do fixed_lit[s] = 7 end
-  for s = 280, 287 do fixed_lit[s] = 8 end
+  for sym = 0, 143 do fixed_lit[sym] = 8 end
+  for sym = 144, 255 do fixed_lit[sym] = 9 end
+  for sym = 256, 279 do fixed_lit[sym] = 7 end
+  for sym = 280, 287 do fixed_lit[sym] = 8 end
   local fixed_dist = {}
-  for s = 0, 29 do fixed_dist[s] = 5 end
+  for sym = 0, 29 do fixed_dist[sym] = 5 end
 
   repeat
     local bfinal = getbits(1)
     local btype = getbits(2)
     if btype == 0 then
-      -- bloc stocké : aligner sur l'octet
       local drop = bitcnt % 8
-      bitbuf = bitbuf >> drop
-      bitcnt = bitcnt - drop
+      bitbuf = bitbuf >> drop; bitcnt = bitcnt - drop
       local len = getbits(16)
       local nlen = getbits(16)
-      if (len ~ 0xFFFF) ~= nlen then
-        error("xlsx: inflate: bloc stocké corrompu", 0)
-      end
-      for _ = 1, len do
-        olen = olen + 1
-        out[olen] = getbits(8)
-      end
+      if (len ~ 0xFFFF) ~= nlen then error("xlsx: inflate: bloc stocké corrompu", 0) end
+      reserve(len)
+      for _ = 1, len do olen = olen + 1; out[olen] = getbits(8) end
     elseif btype == 1 then
       local lc, ls = huff_build(fixed_lit, 288)
       local dc, ds = huff_build(fixed_dist, 30)
@@ -623,26 +777,32 @@ local function inflate(input)
       for i = 0, 18 do cll[i] = 0 end
       for i = 1, hclen do cll[CLC_ORDER[i]] = getbits(3) end
       local clc, cls = huff_build(cll, 19)
-      local all = {}
-      local i = 0
-      local total = hlit + hdist
+      local all, i, total = {}, 0, hlit + hdist
       while i < total do
         local sym = decode(clc, cls)
         if sym < 16 then
           all[i] = sym; i = i + 1
         elseif sym == 16 then
-          local prev = all[i - 1]
-          for _ = 1, getbits(2) + 3 do all[i] = prev; i = i + 1 end
+          if i == 0 then error("xlsx: inflate: répétition sans longueur précédente", 0) end
+          local prev, count = all[i - 1], getbits(2) + 3
+          if i + count > total then error("xlsx: inflate: longueurs débordantes", 0) end
+          for _ = 1, count do all[i] = prev; i = i + 1 end
         elseif sym == 17 then
-          for _ = 1, getbits(3) + 3 do all[i] = 0; i = i + 1 end
+          local count = getbits(3) + 3
+          if i + count > total then error("xlsx: inflate: longueurs débordantes", 0) end
+          for _ = 1, count do all[i] = 0; i = i + 1 end
+        elseif sym == 18 then
+          local count = getbits(7) + 11
+          if i + count > total then error("xlsx: inflate: longueurs débordantes", 0) end
+          for _ = 1, count do all[i] = 0; i = i + 1 end
         else
-          for _ = 1, getbits(7) + 11 do all[i] = 0; i = i + 1 end
+          error("xlsx: inflate: code de longueur invalide", 0)
         end
       end
-      local litl = {}
+      local litl, distl = {}, {}
       for k = 0, hlit - 1 do litl[k] = all[k] end
-      local distl = {}
       for k = 0, hdist - 1 do distl[k] = all[hlit + k] end
+      if (litl[256] or 0) == 0 then error("xlsx: inflate: symbole de fin absent", 0) end
       local lc, ls = huff_build(litl, hlit)
       local dc, ds = huff_build(distl, hdist)
       inflate_block(lc, ls, dc, ds)
@@ -651,12 +811,10 @@ local function inflate(input)
     end
   until bfinal == 1
 
-  -- octets -> string (par paquets pour rester sous la limite de table.unpack)
-  local parts = {}
-  local CHUNK = 2000
+  if pos <= n then error("xlsx: inflate: octets finaux étrangers", 0) end
+  local parts, CHUNK = {}, 2000
   for i = 1, olen, CHUNK do
-    local j = i + CHUNK - 1
-    if j > olen then j = olen end
+    local j = math.min(i + CHUNK - 1, olen)
     parts[#parts + 1] = string.char(table.unpack(out, i, j))
   end
   return table.concat(parts)
@@ -679,35 +837,128 @@ local function find_eocd(s)
   error("xlsx: EOCD zip introuvable (pas un xlsx ?)", 0)
 end
 
-local function read_zip(s)
+local function require_range(s, pos, count, what)
+  if pos < 1 or count < 0 or pos + count - 1 > #s then
+    error("xlsx: " .. what .. " hors limites", 0)
+  end
+end
+
+local function safe_zip_name(name, max_path_length)
+  if #name == 0 or #name > max_path_length or not utf8.len(name) or name:find("\0", 1, true)
+      or name:sub(1, 1) == "/" or name:find("\\", 1, true) then return false end
+  local first = name:match("^([^/]+)") or ""
+  if first:match("^[A-Za-z]:") then return false end
+  for part in name:gmatch("[^/]+") do
+    if part == "." or part == ".." then return false end
+  end
+  return not name:find("//", 1, true)
+end
+
+local function read_zip(s, limits)
   local eocd = find_eocd(s)
-  local _, _, _, _, nTotal, _, cdOff = string.unpack("<I4 I2 I2 I2 I2 I4 I4", s, eocd)
-  local byname = {}
-  local pos = cdOff + 1
-  for _ = 1, nTotal do
-    local sig, _vm, _vn, _fl, method, _mt, _md, _crc, csize, _us,
-          namelen, extralen, commentlen, _ds, _ia, _ea, lhoff, np =
+  require_range(s, eocd, 22, "EOCD ZIP")
+  local sig, disk, cd_disk, n_disk, n_total, cd_size, cd_off, comment_len =
+    string.unpack("<I4 I2 I2 I2 I2 I4 I4 I2", s, eocd)
+  if sig ~= SIG_EOCD then error("xlsx: EOCD ZIP invalide", 0) end
+  if disk ~= 0 or cd_disk ~= 0 or n_disk ~= n_total then error("xlsx: ZIP multidisque non supporté", 0) end
+  if n_total == 0xFFFF or cd_size == 0xFFFFFFFF or cd_off == 0xFFFFFFFF then
+    error("xlsx: ZIP64 non supporté par le lecteur Lua", 0)
+  end
+  if n_total > limits.max_entries then error("xlsx: trop d'entrées ZIP", 0) end
+  if eocd + 22 + comment_len - 1 ~= #s then error("xlsx: commentaire ou données finales ZIP incohérents", 0) end
+  local cd_start, cd_end = cd_off + 1, cd_off + cd_size
+  if cd_start < 1 or cd_end >= eocd or cd_end > #s then error("xlsx: répertoire central ZIP hors limites", 0) end
+
+  local byname, entries, total_size, total_name_bytes, pos = {}, {}, 0, 0, cd_start
+  for index = 1, n_total do
+    require_range(s, pos, 46, "entrée du répertoire central")
+    local csig, _vm, _vn, flags, method, _mt, _md, crc, csize, usize,
+          namelen, extralen, commentlen, diskstart, _ia, _ea, lhoff, np =
       string.unpack("<I4 I2 I2 I2 I2 I2 I2 I4 I4 I4 I2 I2 I2 I2 I2 I4 I4", s, pos)
-    if sig ~= 0x02014b50 then error("xlsx: répertoire central zip corrompu", 0) end
+    if csig ~= SIG_CENTRAL then error("xlsx: répertoire central ZIP corrompu", 0) end
+    require_range(s, np, namelen + extralen + commentlen, "nom/métadonnées ZIP")
     local name = s:sub(np, np + namelen - 1)
-    byname[name] = { method = method, csize = csize, lhoff = lhoff }
+    if not safe_zip_name(name, limits.max_path_length) then error("xlsx: nom d'entrée ZIP dangereux : " .. name, 0) end
+    if byname[name] then error("xlsx: entrée ZIP dupliquée : " .. name, 0) end
+    total_name_bytes = total_name_bytes + #name
+    if total_name_bytes > limits.max_total_name_bytes then error("xlsx: budget cumulé des noms ZIP dépassé", 0) end
+    if diskstart ~= 0 then error("xlsx: entrée ZIP située sur un autre disque", 0) end
+    if (flags & 0x0001) ~= 0 then error("xlsx: entrée ZIP chiffrée non supportée", 0) end
+    if method ~= 0 and method ~= 8 then error("xlsx: méthode de compression ZIP non supportée : " .. method, 0) end
+    if usize > limits.max_entry_size then error("xlsx: entrée ZIP trop volumineuse : " .. name, 0) end
+    total_size = total_size + usize
+    if total_size > limits.max_total_size then error("xlsx: taille totale décompressée trop grande", 0) end
+    if usize > 0 and csize == 0 then error("xlsx: taille compressée nulle pour une entrée non vide", 0) end
+    if usize > 0 and usize / math.max(csize, 1) > limits.max_compression_ratio then
+      error("xlsx: rapport de compression excessif : " .. name, 0)
+    end
+    local e = { name=name, flags=flags, method=method, crc=crc, csize=csize, usize=usize,
+      lhoff=lhoff, index=index }
+    byname[name], entries[#entries + 1] = e, e
     pos = np + namelen + extralen + commentlen
+  end
+  if pos ~= cd_end + 1 then error("xlsx: taille du répertoire central ZIP incohérente", 0) end
+
+  local ranges = {}
+  for _, e in ipairs(entries) do
+    local lp = e.lhoff + 1
+    require_range(s, lp, 30, "en-tête local ZIP")
+    local lsig, _v, lflags, lmethod, _t, _d, lcrc, lcsize, lusize, lnamelen, lextralen, dp =
+      string.unpack("<I4 I2 I2 I2 I2 I2 I4 I4 I4 I2 I2", s, lp)
+    if lsig ~= SIG_LOCAL then error("xlsx: en-tête local ZIP corrompu : " .. e.name, 0) end
+    require_range(s, dp, lnamelen + lextralen, "nom local ZIP")
+    local lname = s:sub(dp, dp + lnamelen - 1)
+    if lname ~= e.name or lmethod ~= e.method or lflags ~= e.flags then
+      error("xlsx: incohérence entre en-tête local et central : " .. e.name, 0)
+    end
+    if (e.flags & 0x0008) == 0 and (lcrc ~= e.crc or lcsize ~= e.csize or lusize ~= e.usize) then
+      error("xlsx: tailles ou CRC locaux incohérents : " .. e.name, 0)
+    end
+    local data_start = dp + lnamelen + lextralen
+    local data_end = data_start + e.csize - 1
+    if e.csize > 0 then require_range(s, data_start, e.csize, "données ZIP") end
+    local local_end = math.max(dp + lnamelen + lextralen - 1, data_end)
+    if (e.flags & 0x0008) ~= 0 then
+      local desc = data_end + 1
+      require_range(s, desc, 12, "data descriptor ZIP")
+      local first = string.unpack("<I4", s, desc)
+      local dcrc, dcsize, dusize
+      if first == 0x08074b50 then
+        require_range(s, desc, 16, "data descriptor ZIP")
+        local descriptor_sig
+        descriptor_sig, dcrc, dcsize, dusize = string.unpack("<I4 I4 I4 I4", s, desc)
+        local_end = desc + 15
+      else
+        dcrc, dcsize, dusize = string.unpack("<I4 I4 I4", s, desc)
+        local_end = desc + 11
+      end
+      if dcrc ~= e.crc or dcsize ~= e.csize or dusize ~= e.usize then
+        error("xlsx: data descriptor ZIP incohérent : " .. e.name, 0)
+      end
+    end
+    if local_end >= cd_start then error("xlsx: entrée ZIP chevauchant le répertoire central", 0) end
+    e.data_start, e.data_end, e.local_start, e.local_end = data_start, data_end, lp, local_end
+    ranges[#ranges + 1] = e
+  end
+  table.sort(ranges, function(a,b) return a.local_start < b.local_start end)
+  for i = 2, #ranges do
+    if ranges[i].local_start <= ranges[i - 1].local_end then error("xlsx: entrées ZIP chevauchantes", 0) end
   end
   return byname
 end
 
-local function zip_extract(s, e)
-  local sig, _v, _f, _m, _t, _d, _c, _cs, _us, lnamelen, lextralen, dp =
-    string.unpack("<I4 I2 I2 I2 I2 I2 I4 I4 I4 I2 I2", s, e.lhoff + 1)
-  if sig ~= 0x04034b50 then error("xlsx: en-tête local zip corrompu", 0) end
-  local start = dp + lnamelen + lextralen
-  local comp = s:sub(start, start + e.csize - 1)
+local function zip_extract(s, e, limits)
+  local comp = e.csize == 0 and "" or s:sub(e.data_start, e.data_end)
+  local data
   if e.method == 0 then
-    return comp
-  elseif e.method == 8 then
-    return inflate(comp)
+    if e.csize ~= e.usize then error("xlsx: entrée STORED avec tailles différentes : " .. e.name, 0) end
+    data = comp
+  else
+    data = inflate(comp, math.min(e.usize, limits.max_entry_size))
   end
-  error("xlsx: méthode de compression zip non supportée : " .. e.method, 0)
+  if #data ~= e.usize then error("xlsx: taille décompressée incohérente : " .. e.name, 0) end
+  if crc32(data) ~= e.crc then error("xlsx: CRC-32 invalide : " .. e.name, 0) end
+  return data
 end
 
 -- ----------------------------------------------------------------------------
@@ -720,9 +971,12 @@ local function unescape(s)
     local known = ENT[e]
     if known then return known end
     local hex = e:match("^#[xX](%x+)$")
-    if hex then return utf8.char(tonumber(hex, 16)) end
     local dec = e:match("^#(%d+)$")
-    if dec then return utf8.char(tonumber(dec)) end
+    local cp = hex and tonumber(hex, 16) or (dec and tonumber(dec) or nil)
+    if cp then
+      if not is_xml_codepoint(cp) then error("xlsx: entité XML vers un caractère interdit", 0) end
+      return utf8.char(cp)
+    end
     return "&" .. e .. ";"
   end))
 end
@@ -730,11 +984,15 @@ end
 local function ref_to_rowcol(ref)
   local letters, digits = ref:match("^(%a+)(%d+)$")
   if not letters then return nil end
+  letters = letters:upper()
   local col = 0
-  for i = 1, #letters do
-    col = col * 26 + (string.byte(letters, i) - 64)
+  for i = 1, #letters do col = col * 26 + (string.byte(letters, i) - 64) end
+  local row = tonumber(digits) - 1
+  col = col - 1
+  if row < 0 or row > MAX_ROW or col < 0 or col > MAX_COL then
+    error("xlsx: référence de cellule hors limites : " .. ref, 0)
   end
-  return tonumber(digits) - 1, col - 1
+  return row, col
 end
 
 local function parse_shared_strings(xml)
@@ -754,21 +1012,31 @@ end
 
 local function decode_cell(inner, ty, shared)
   if ty == "s" then
-    local v = inner:match("<v>(.-)</v>")
-    if not v then return nil end
-    return shared[tonumber(v)]
+    local raw = inner:match("<v>(.-)</v>")
+    if not raw then return nil end
+    local index = tonumber(raw)
+    if not index or math.type(index) ~= "integer" or index < 0 or shared[index] == nil then
+      error("xlsx: index sharedStrings invalide : " .. tostring(raw), 0)
+    end
+    return shared[index]
   elseif ty == "b" then
-    return inner:match("<v>(.-)</v>") == "1"
+    local raw = inner:match("<v>(.-)</v>")
+    if raw == "1" then return true end
+    if raw == "0" then return false end
+    error("xlsx: booléen de cellule invalide", 0)
   elseif ty == "inlineStr" then
     local buf = {}
-    for t in inner:gmatch("<t[^>]*>(.-)</t>") do buf[#buf + 1] = unescape(t) end
+    for text in inner:gmatch("<t[^>]*>(.-)</t>") do buf[#buf + 1] = unescape(text) end
     return table.concat(buf)
-  elseif ty == "str" then
-    local v = inner:match("<v>(.-)</v>")
-    return v and unescape(v) or nil
+  elseif ty == "str" or ty == "d" or ty == "e" then
+    local raw = inner:match("<v>(.-)</v>")
+    return raw and unescape(raw) or nil
   else
-    local v = inner:match("<v>(.-)</v>")
-    return v and tonumber(v) or nil
+    local raw = inner:match("<v>(.-)</v>")
+    if not raw then return nil end
+    local value = tonumber(raw)
+    if value == nil then error("xlsx: valeur numérique invalide : " .. raw, 0) end
+    return value
   end
 end
 
@@ -814,7 +1082,7 @@ local function parse_styles(xml)
   return datestyle
 end
 
-local function parse_sheet(xml, shared, datestyle)
+local function parse_sheet(xml, shared, datestyle, date1904)
   local cells = {}
   local maxrow, maxcol = -1, -1
   for crow in xml:gmatch("<row[%s>].-</row>") do
@@ -840,7 +1108,7 @@ local function parse_sheet(xml, shared, datestyle)
       -- conversion date : cellule numérique portant un style de date
       if type(value) == "number" and st and datestyle then
         local cls = datestyle[tonumber(st)]
-        if cls then value = serial_to_iso(value, cls == "datetime") end
+        if cls then value = serial_to_iso(value, cls == "datetime", date1904) end
       end
       if ref and value ~= nil then
         local r0, c0 = ref_to_rowcol(ref)
@@ -858,30 +1126,55 @@ local function parse_sheet(xml, shared, datestyle)
   return cells, maxrow, maxcol
 end
 
+local function package_path(base, target)
+  if target:find("\\", 1, true) or target:find("\0", 1, true) then return nil end
+  local raw = target:sub(1,1) == "/" and target:sub(2) or (base .. target)
+  local out = {}
+  for part in raw:gmatch("[^/]+") do
+    if part == "." then
+      -- ignore
+    elseif part == ".." then
+      if #out == 0 then return nil end
+      out[#out] = nil
+    elseif part ~= "" then
+      out[#out + 1] = part
+    end
+  end
+  return table.concat(out, "/")
+end
+
 local function parse_workbook(wbxml, relsxml)
   local rid2target = {}
   for tag in relsxml:gmatch("<Relationship%s.-/>") do
     local id = tag:match('Id="([^"]*)"')
     local target = tag:match('Target="([^"]*)"')
-    if id and target then rid2target[id] = target end
+    if id and target then rid2target[id] = unescape(target) end
   end
-  local sheets = {}
+  local sheets, seen = {}, {}
   for tag in wbxml:gmatch("<sheet%s.-/>") do
-    local name = tag:match('name="([^"]*)"')
+    local name = unescape(tag:match('name="([^"]*)"') or "")
+    local name_count = validate_xml_text(name, "nom de feuille lu", 0)
+    if name_count == 0 or name_count > 31 or name:find('[:\\/?*%[%]]')
+        or name:sub(1,1) == "'" or name:sub(-1) == "'" then
+      error("xlsx: nom de feuille invalide dans le classeur : " .. name, 0)
+    end
+    local name_key = name:lower()
+    if seen[name_key] then error("xlsx: nom de feuille dupliqué dans le classeur : " .. name, 0) end
+    seen[name_key] = true
     local rid = tag:match('r:id="([^"]*)"')
-    sheets[#sheets + 1] = { name = unescape(name or ""), rid = rid }
+    sheets[#sheets + 1] = { name = name, rid = rid }
   end
   for _, sh in ipairs(sheets) do
-    local t = rid2target[sh.rid]
-    if t then
-      if t:sub(1, 1) == "/" then
-        sh.path = t:sub(2)
-      else
-        sh.path = "xl/" .. t
-      end
+    local target = rid2target[sh.rid]
+    if target then
+      sh.path = package_path("xl/", target)
+      if not sh.path then error("xlsx: cible de feuille dangereuse", 0) end
     end
   end
-  return sheets
+  local workbook_pr = wbxml:match("<workbookPr%s.-/>") or wbxml:match("<workbookPr%s.-</workbookPr>") or ""
+  local date1904 = workbook_pr:match('date1904="([^"]+)"')
+  date1904 = date1904 == "1" or date1904 == "true"
+  return sheets, date1904
 end
 
 -- ----------------------------------------------------------------------------
@@ -892,9 +1185,8 @@ ReadSheet.__index = ReadSheet
 
 --- Lit une cellule (row, col 0-indexés, comme à l'écriture). nil si vide.
 function ReadSheet:read(r, c)
-  if math.type(r) ~= "integer" or math.type(c) ~= "integer" then
-    error("xlsx: read attend des entiers (row, col)", 2)
-  end
+  check_index(r, "row", 3)
+  check_index(c, "col", 3)
   local row = self.cells[r]
   if not row then return nil end
   return row[c]
@@ -924,6 +1216,11 @@ end
 local ReadWB = {}
 ReadWB.__index = ReadWB
 
+--- Système de dates du classeur lu : "1900" ou "1904".
+function ReadWB:date_system()
+  return self._date1904 and "1904" or "1900"
+end
+
 --- Liste ordonnée des noms de feuilles.
 function ReadWB:sheet_names()
   local t = {}
@@ -935,6 +1232,9 @@ end
 function ReadWB:sheet(which)
   local def
   if type(which) == "number" then
+    if math.type(which) ~= "integer" or which < 1 then
+      error("xlsx: l'index de feuille doit être un entier >= 1", 2)
+    end
     def = self._sheets[which]
   elseif type(which) == "string" then
     for _, sh in ipairs(self._sheets) do
@@ -948,48 +1248,138 @@ function ReadWB:sheet(which)
   if not def.path then return nil, "xlsx: cible de feuille introuvable" end
   local e = self._byname[def.path]
   if not e then return nil, "xlsx: partie manquante : " .. def.path end
-  local cells, maxrow, maxcol = parse_sheet(zip_extract(self._data, e), self._shared, self._datestyle)
+  local ok, cells, maxrow, maxcol = pcall(function()
+    local xml = validate_xml_document(zip_extract(self._data, e, self._limits), def.path)
+    return parse_sheet(xml, self._shared, self._datestyle, self._date1904)
+  end)
+  if not ok then return nil, tostring(cells) end
   local rs = setmetatable(
-    { name = def.name, cells = cells, maxrow = maxrow, maxcol = maxcol },
-    ReadSheet)
+    { name = def.name, cells = cells, maxrow = maxrow, maxcol = maxcol }, ReadSheet)
   self._cache[def] = rs
   return rs
 end
 
---- Ouvre un .xlsx en lecture. Renvoie un workbook, ou (nil, err).
-function xlsx.open(path)
-  if type(path) ~= "string" then
-    error("xlsx: open attend un chemin (string)", 2)
+local OPEN_DEFAULTS = {
+  max_file_size = 256 * 1024 * 1024,
+  max_entries = 10000,
+  max_entry_size = 64 * 1024 * 1024,
+  max_total_size = 512 * 1024 * 1024,
+  max_path_length = 4096,
+  max_total_name_bytes = 16 * 1024 * 1024,
+  max_compression_ratio = 200,
+  use_babet = true,
+  validate_archive = true,
+}
+
+local function open_options(opts)
+  opts = opts or {}
+  if type(opts) ~= "table" then error("xlsx: open attend une table d'options", 3) end
+  local out = {}
+  for k, default in pairs(OPEN_DEFAULTS) do out[k] = opts[k] == nil and default or opts[k] end
+  for k in pairs(opts) do if OPEN_DEFAULTS[k] == nil then error("xlsx: option inconnue pour open : " .. tostring(k), 3) end end
+  for _, k in ipairs({"max_file_size","max_entries","max_entry_size","max_total_size","max_path_length","max_total_name_bytes"}) do
+    if math.type(out[k]) ~= "integer" or out[k] <= 0 then error("xlsx: " .. k .. " doit être un entier positif", 3) end
   end
+  local ceilings = {
+    max_entries = 100000, max_entry_size = 8 * 1024^3,
+    max_total_size = 64 * 1024^3, max_path_length = 1024 * 1024,
+    max_total_name_bytes = 64 * 1024 * 1024,
+  }
+  for k, ceiling in pairs(ceilings) do
+    if out[k] > ceiling then error("xlsx: " .. k .. " dépasse le plafond " .. ceiling, 3) end
+  end
+  if type(out.max_compression_ratio) ~= "number" or out.max_compression_ratio < 1
+      or out.max_compression_ratio ~= out.max_compression_ratio or out.max_compression_ratio == math.huge
+      or out.max_compression_ratio > 1000000000 then
+    error("xlsx: max_compression_ratio doit être un nombre fini >= 1", 3)
+  end
+  for _, k in ipairs({"use_babet","validate_archive"}) do
+    if type(out[k]) ~= "boolean" then error("xlsx: " .. k .. " doit être un booléen", 3) end
+  end
+  return out
+end
+
+local function file_size_lua(path)
   local f, err = io.open(path, "rb")
-  if not f then
-    return nil, "xlsx: impossible d'ouvrir '" .. path .. "' : " .. tostring(err)
+  if not f then return nil, err end
+  local size, seek_err = f:seek("end")
+  local closed, close_err = f:close()
+  if not size then return nil, seek_err end
+  if not closed then return nil, close_err end
+  return size
+end
+
+local function checked_file_size(path, opts)
+  local fn = opts.use_babet and babet_function("fileSize") or nil
+  if fn then
+    local ok, size, err = pcall(fn, path)
+    if not ok then return nil, "fileSize a levé une erreur : " .. tostring(size) end
+    if not size then return nil, err end
+    return size
   end
-  local data = f:read("a")
-  f:close()
+  return file_size_lua(path)
+end
 
-  local ok, byname = pcall(read_zip, data)
-  if not ok then return nil, byname end
+local function validate_with_babet(path, opts)
+  local runtime = opts.use_babet and get_babet() or nil
+  local archive = runtime and type(runtime.archive) == "table" and runtime.archive or nil
+  local fn = archive and archive.test
+  if not opts.validate_archive or type(fn) ~= "function" then return true end
+  local ok, result, err = pcall(fn, path, {
+    max_entries = opts.max_entries,
+    max_entry_size = opts.max_entry_size,
+    max_total_size = opts.max_total_size,
+    max_path_length = opts.max_path_length,
+    max_total_name_bytes = opts.max_total_name_bytes,
+    max_compression_ratio = opts.max_compression_ratio,
+  })
+  if not ok then return nil, "archive.test a levé une erreur : " .. tostring(result) end
+  if not result then return nil, err end
+  if result.format ~= "zip" then return nil, "le conteneur n'est pas un ZIP" end
+  return true
+end
 
-  local function part(name)
-    local e = byname[name]
-    return e and zip_extract(data, e) or nil
-  end
+--- Ouvre un .xlsx en lecture. Renvoie un workbook, ou (nil, err).
+function xlsx.open(path, opts)
+  if type(path) ~= "string" then error("xlsx: open attend un chemin (string)", 2) end
+  local limits = open_options(opts)
 
-  local ok2, wbxml = pcall(part, "xl/workbook.xml")
-  if not ok2 then return nil, wbxml end
-  if not wbxml then return nil, "xlsx: xl/workbook.xml manquant (pas un xlsx ?)" end
+  local size, size_err = checked_file_size(path, limits)
+  if not size then return nil, "xlsx: impossible d'inspecter '" .. path .. "' : " .. tostring(size_err) end
+  if size > limits.max_file_size then return nil, "xlsx: fichier trop volumineux" end
 
-  local relsxml = part("xl/_rels/workbook.xml.rels") or ""
-  local ssxml = part("xl/sharedStrings.xml")
-  local shared = ssxml and parse_shared_strings(ssxml) or {}
-  local sheets = parse_workbook(wbxml, relsxml)
-  local datestyle = parse_styles(part("xl/styles.xml"))
+  local valid, valid_err = validate_with_babet(path, limits)
+  if not valid then return nil, "xlsx: archive refusée par Babet : " .. tostring(valid_err) end
 
-  return setmetatable({
-    _data = data, _byname = byname, _shared = shared,
-    _sheets = sheets, _cache = {}, _datestyle = datestyle,
-  }, ReadWB)
+  local f, err = io.open(path, "rb")
+  if not f then return nil, "xlsx: impossible d'ouvrir '" .. path .. "' : " .. tostring(err) end
+  local data, read_err = f:read("a")
+  local closed, close_err = f:close()
+  if not data then return nil, "xlsx: échec de lecture : " .. tostring(read_err) end
+  if not closed then return nil, "xlsx: échec de fermeture : " .. tostring(close_err) end
+  if #data > limits.max_file_size then return nil, "xlsx: fichier modifié ou trop volumineux pendant la lecture" end
+
+  local ok, result = pcall(function()
+    local byname = read_zip(data, limits)
+    local function part(name)
+      local e = byname[name]
+      if not e then return nil end
+      return validate_xml_document(zip_extract(data, e, limits), name)
+    end
+    local wbxml = part("xl/workbook.xml")
+    if not wbxml then error("xlsx: xl/workbook.xml manquant (pas un xlsx ?)", 0) end
+    local relsxml = part("xl/_rels/workbook.xml.rels") or ""
+    local ssxml = part("xl/sharedStrings.xml")
+    local shared = ssxml and parse_shared_strings(ssxml) or {}
+    local sheets, date1904 = parse_workbook(wbxml, relsxml)
+    local datestyle = parse_styles(part("xl/styles.xml"))
+    return setmetatable({
+      _data=data, _byname=byname, _shared=shared, _sheets=sheets,
+      _cache={}, _datestyle=datestyle, _date1904=date1904, _limits=limits,
+    }, ReadWB)
+  end)
+  if not ok then return nil, tostring(result) end
+  return result
 end
 
 return xlsx

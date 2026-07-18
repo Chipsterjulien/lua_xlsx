@@ -1,141 +1,197 @@
-# lua-xlsx-df
+# lua-xlsx
 
-Pure-Lua **XLSX read/write** and a small **DataFrame** layer (filter / groupby /
-aggregate), with **zero external dependencies** — no C extension, no `unzip`, no
-SQLite. Designed for and tested on [LuaPilot](https://github.com/Chipsterjulien/luapilot_standalone)
-(Lua 5.5), and compatible with any standard Lua 5.3+.
+Bibliothèque Lua pour **lire et écrire des fichiers XLSX**, accompagnée d'une
+petite couche **DataFrame**. Le cœur reste en Lua pur et fonctionne avec Lua
+5.3+, tandis que [Babet](https://github.com/Chipsterjulien/babet) et Lua 5.5
+constituent la cible principale et recommandée.
 
-> 🇫🇷 Documentation française : [`doc/documentation-fr.md`](doc/documentation-fr.md)
-> · 🇬🇧 English documentation: [`doc/documentation-en.md`](doc/documentation-en.md)
+- Documentation française : [`doc/documentation-fr.md`](doc/documentation-fr.md)
+- English documentation: [`doc/documentation-en.md`](doc/documentation-en.md)
+- PDF : exécuter [`doc/build_doc.sh`](doc/build_doc.sh)
 
-![Lua 5.3+](https://img.shields.io/badge/Lua-5.3%2B-blue)
-![License GPLv3](https://img.shields.io/badge/license-GPLv3-blue)
+## Points forts
 
-## Features
+- Écriture de classeurs XLSX : chaînes, nombres, booléens, dates, dates-heures,
+  plusieurs feuilles et cellules éparses.
+- Lecture des ZIP XLSX STORED ou DEFLATE avec un décompresseur DEFLATE Lua.
+- Contrôle du CRC-32, des tailles, des offsets, des doublons, du chiffrement,
+  des chevauchements et des rapports de compression.
+- Systèmes de dates Excel **1900 et 1904** en lecture et en écriture.
+- Validation UTF-8 et XML 1.0 des textes, noms de feuilles Unicode et limites
+  Excel officielles.
+- DataFrame non destructif : `filter`, `select`, `rename`, `mutate`, `sort`,
+  `head`, `tail`, `groupby` et agrégations.
+- Intégration automatique à Babet lorsqu'il est présent :
+  `babet.writeFileAtomic`, `babet.archive.test`, `babet.fileSize` et
+  `babet.crc32`.
+- Aucun module C obligatoire et aucune commande `unzip` externe.
 
-- **Write** `.xlsx` files: strings, integers, floats, booleans, dates and
-  date-times, multiple worksheets, sparse cells. Output is a STORED (uncompressed)
-  ZIP that Excel, LibreOffice and openpyxl read without complaint.
-- **Read** real-world `.xlsx` files: a complete **DEFLATE inflater written in pure
-  Lua** (so compressed files from Excel/LibreOffice/pandas work), shared strings,
-  inline strings, multiple sheets, sparse cells, and automatic conversion of date
-  cells to ISO 8601 strings.
-- **DataFrame** layer: `filter`, `select`, `mutate`, `sort`, `groupby` / `agg`
-  (sum, mean, min, max, count, first, last), and exports back to a matrix you can
-  hand straight to the writer.
-- **No dependencies.** Only the Lua standard library (`string`, `table`, `math`,
-  `utf8`, `io`). Nothing is required from LuaPilot itself.
+## Prérequis
 
-## Requirements
-
-- Lua **5.3, 5.4 or 5.5** (uses bitwise operators, `string.pack`/`unpack`,
-  `math.type`, `utf8.char`, integer `//`). Lua 5.1/5.2 are **not** supported.
-- A Lua build with the `io` library available (for reading/writing files on disk).
+- Cible recommandée : **Babet 2.9.0+**, donc Lua 5.5.
+- Compatibilité conservée : Lua 5.3 et 5.4 avec `string.pack`, les opérateurs
+  bit-à-bit, `math.type`, `utf8` et la bibliothèque `io`.
+- Lua 5.1 et 5.2 ne sont pas pris en charge.
 
 ## Installation
 
-Copy `xlsx.lua` and `dataframe.lua` next to your script (or anywhere on your
-`package.path`). Under LuaPilot in folder mode, dropping them beside `main.lua`
-is enough — `require` finds them automatically.
+Copier `xlsx.lua` et `dataframe.lua` à côté du script ou dans `package.path` :
 
 ```lua
 local xlsx = require("xlsx")
-local DF   = require("dataframe")
+local DF = require("dataframe")
 ```
 
-## Quick start
+Sous Babet en mode dossier, placer les modules à côté de `main.lua` suffit.
 
-### Write
+## Écriture rapide
 
 ```lua
 local xlsx = require("xlsx")
 
 local wb = xlsx.new()
-local sh = wb:add_sheet("Report")
-sh:write(0, 0, "Name")                 -- (row, col), 0-indexed
-sh:append_row({ "Alice", 30, true })
-sh:write(2, 0, xlsx.date(2024, 3, 15)) -- a real date cell
-wb:save("report.xlsx")
+local sh = wb:add_sheet("Rapport")
 
--- one-liner for a whole matrix:
-xlsx.write_rows("quick.xlsx", { {"x","y"}, {1,2}, {3,4} })
+sh:append_row({ "Nom", "Âge", "Actif", "Date" })
+sh:append_row({ "Alice", 30, true, xlsx.date(2026, 7, 18) })
+
+local ok, err = wb:save("rapport.xlsx")
+assert(ok, err)
 ```
 
-### Read
+Sous Babet, `save()` utilise automatiquement une publication atomique et
+durable. Sous Lua standard, un temporaire est écrit puis renommé dans le même
+dossier.
+
+## Lecture rapide
 
 ```lua
 local xlsx = require("xlsx")
 
-local wb = xlsx.open("report.xlsx")
-for _, name in ipairs(wb:sheet_names()) do
-  local sh = wb:sheet(name)
-  print(sh:read(0, 0))                  -- direct access, 0-indexed
-  for row in sh:rows() do               -- row is 1-indexed (row[1] = column A)
-    for c = 1, row.n do io.write(tostring(row[c]), "\t") end
-    io.write("\n")
+local wb, err = xlsx.open("rapport.xlsx")
+assert(wb, err)
+
+print("Système de dates :", wb:date_system())
+local sh = assert(wb:sheet("Rapport"))
+
+for row in sh:rows() do
+  for col = 1, row.n do
+    io.write(tostring(row[col]), "\t")
   end
+  io.write("\n")
 end
 ```
 
-### DataFrame
+Les dates sont renvoyées sous forme ISO 8601, par exemple `2026-07-18` ou
+`2026-07-18T13:45:30`.
+
+## DataFrame
 
 ```lua
 local xlsx = require("xlsx")
-local DF   = require("dataframe")
+local DF = require("dataframe")
 
-local d = DF.from_sheet(xlsx.open("sales.xlsx"):sheet("sales"), { header = true })
+local wb = assert(xlsx.open("ventes.xlsx"))
+local data = DF.from_sheet(assert(wb:sheet("ventes")), { header = true })
 
-local summary = d
-  :mutate("total", function(r) return r.qty * r.price end)
-  :filter(function(r) return r.total >= 30 end)
-  :groupby("city")
-  :agg({ total = {"sum","total"}, n = {"count"}, max_price = {"max","price"} })
+local résumé = data
+  :mutate("total", function(row)
+    return row.quantité * row.prix
+  end)
+  :filter(function(row)
+    return row.total >= 30
+  end)
+  :groupby("ville")
+  :agg({
+    total = { "sum", "total" },
+    moyenne = { "mean", "total" },
+    nombre = { "count" },
+  })
   :sort("total", { desc = true })
 
-summary:show()
-xlsx.write_rows("summary.xlsx", summary:to_rows())
+assert(xlsx.write_rows("résumé.xlsx", résumé:to_rows(), {
+  sheet = "Résumé",
+}))
 ```
+
+Les transformations copient les records qu'elles retournent. Modifier une
+ligne du résultat ne modifie donc pas le DataFrame source.
+
+## Limites de sécurité configurables
+
+```lua
+local wb, err = xlsx.open("import.xlsx", {
+  max_file_size = 256 * 1024 * 1024,
+  max_entries = 10000,
+  max_entry_size = 64 * 1024 * 1024,
+  max_total_size = 512 * 1024 * 1024,
+  max_path_length = 4096,
+  max_total_name_bytes = 16 * 1024 * 1024,
+  max_compression_ratio = 200,
+})
+assert(wb, err)
+```
+
+Avec Babet, ces limites sont également transmises à `babet.archive.test()`
+avant le parseur Lua.
 
 ## Tests
 
-`selftest.lua` is a self-contained harness: it writes a workbook, reads it back,
-runs the DataFrame pipeline and checks dates, all via assertions. Run it on your
-target to confirm everything works:
-
 ```sh
-# LuaPilot folder mode (rename selftest.lua to main.lua in a folder
-# that also contains xlsx.lua and dataframe.lua):
-./bin/luapilot .
-
-# or with any standard Lua 5.3+:
-lua selftest.lua
+./run_tests.sh
 ```
 
-Expected last line: `SELFTEST : PASS  (Lua 5.5)`.
+Le script :
 
-## Documentation
+1. cherche Babet dans `BABET_BIN`, puis dans `bin/babet`, puis dans le `PATH` ;
+2. teste aussi un interpréteur Lua standard trouvé sur le système ;
+3. crée un environnement virtuel Python temporaire ;
+4. y installe `openpyxl>=3.1,<4` avec `pip` ;
+5. exécute l'aller-retour `openpyxl` séparément avec Babet et Lua standard lorsqu'ils sont disponibles ;
+6. supprime le venv, le cache `pip` et tous les fichiers temporaires à la fin, y compris après un échec.
 
-The complete API reference lives in [`doc/`](doc/):
+Le test d'interopérabilité n'est plus ignoré lorsque `openpyxl` n'est pas installé
+globalement. Il faut seulement disposer de `python3`, du module `venv` et d'un
+accès au dépôt Python configuré pour `pip`. Sous Debian ou Ubuntu, le paquet
+`python3-venv` peut être nécessaire.
 
-- English — [`doc/documentation-en.md`](doc/documentation-en.md)
-- Français — [`doc/documentation-fr.md`](doc/documentation-fr.md)
+Pour utiliser le binaire local recommandé :
 
-## Limitations
+```sh
+cp /chemin/vers/babet bin/babet
+chmod +x bin/babet
+./run_tests.sh
+```
 
-Intentionally out of scope (all additive later if needed):
+Variables utiles :
 
-- Visual styles (bold, colours, borders) — only date number formats are emitted.
-- Formulas — a formula's *cached value* is read, but the formula itself is not.
-- Merged cells.
-- Writing produces uncompressed (STORED) archives; reading handles both STORED and
-  DEFLATE.
-- Large files: the reader buffers decompressed output in memory; fine for
-  thousands–tens of thousands of rows, heavy for hundreds of MB decompressed.
+```sh
+BABET_BIN=/chemin/vers/babet ./run_tests.sh
+LUA_BIN=/chemin/vers/lua5.5 ./run_tests.sh
+OPENPYXL_SPEC='openpyxl==3.1.5' ./run_tests.sh
+```
 
-Dates use Excel's 1900 date system (epoch 1899-12-30, like openpyxl). The only
-consequence — shared by nearly every library — is Excel's historical 1900 leap-year
-quirk: dates before 1900-03-01 are off by one day.
+## Documentation PDF
 
-## License
+```sh
+cd doc
+./build_doc.sh
+```
 
-GNU General Public License v3.0 — see [`LICENSE`](LICENSE).
+Le script produit `documentation-fr.pdf` et `documentation-en.pdf` à partir des
+fichiers Markdown. Il nécessite Pandoc et XeLaTeX ou LuaLaTeX.
+
+## Limites actuelles
+
+- Pas de styles visuels généraux, de cellules fusionnées ni d'écriture de
+  formules.
+- La valeur mise en cache d'une formule peut être lue, pas la formule elle-même.
+- La lecture reste en mémoire : le ZIP, les XML utiles et les résultats
+  décompressés sont chargés en RAM dans les limites configurées.
+- Le lecteur Lua ne prend pas encore en charge ZIP64. Babet peut valider un ZIP64,
+  mais le parseur interne le refuse ensuite explicitement.
+- Le parseur XML est spécialisé XLSX et ne remplace pas un parseur XML général.
+
+## Licence
+
+GNU General Public License v3.0 — voir [`LICENSE`](LICENSE).

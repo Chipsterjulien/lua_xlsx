@@ -4,23 +4,13 @@
 -- it under the terms of the GNU General Public License as published by
 -- the Free Software Foundation, either version 3 of the License, or
 -- (at your option) any later version.
---
--- This program is distributed in the hope that it will be useful,
--- but WITHOUT ANY WARRANTY; without even the implied warranty of
--- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
--- GNU General Public License for more details.
---
--- You should have received a copy of the GNU General Public License
--- along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 --- selftest.lua — auto-test des modules xlsx + dataframe.
---- À lancer sous LuaPilot (Lua 5.5) pour valider la compatibilité sur la cible.
+--- Cible principale : Babet (Lua 5.5), avec compatibilité Lua standard 5.3+.
 ---
---- Usage (mode dossier) : placer xlsx.lua, dataframe.lua et ce fichier (renommé
---- main.lua) dans un dossier, puis :  ./test/luapilot <dossier>
---- Ou directement :  luapilot selftest.lua   (selon ton mode de lancement)
----
---- N'écrit qu'un fichier temporaire dans le dossier courant, supprimé à la fin.
+--- Sous Babet, placer ce fichier sous le nom main.lua à côté de xlsx.lua et
+--- dataframe.lua, puis lancer : babet <dossier>
+--- Sous Lua standard : lua selftest.lua
 
 local xlsx = require("xlsx")
 local DF   = require("dataframe")
@@ -35,12 +25,35 @@ local function check(cond, msg)
   end
 end
 
+local function expect_error(fn, msg)
+  local ok = pcall(fn)
+  check(not ok, msg)
+end
+
+local function write_file(path, data)
+  local f, err = io.open(path, "wb")
+  assert(f, err)
+  assert(f:write(data))
+  assert(f:close())
+end
+
+local function read_file(path)
+  local f, err = io.open(path, "rb")
+  assert(f, err)
+  local data = assert(f:read("a"))
+  assert(f:close())
+  return data
+end
+
 print("Lua : " .. _VERSION)
+print("Babet : " .. tostring(type(rawget(_G, "babet")) == "table"))
 print("string.pack=" .. tostring(string.pack ~= nil)
   .. "  math.type=" .. tostring(math.type ~= nil)
   .. "  utf8.char=" .. tostring(utf8 and utf8.char ~= nil))
 
 local TMP = "._xlsx_selftest.xlsx"
+local TMP2 = "._xlsx_selftest_2.xlsx"
+local BAD = "._xlsx_selftest_bad.xlsx"
 
 -- ---- ÉCRITURE puis LECTURE -------------------------------------------------
 print("\n[1] écriture + relecture xlsx")
@@ -50,14 +63,15 @@ do
   s:write(0, 0, "Nom"); s:write(0, 1, "Âge"); s:write(0, 2, "Actif"); s:write(0, 3, "Note")
   s:append_row({ "Alice <x>", 30, true,  12.5 })
   s:append_row({ "Bob & Co",  25, false, -0.5 })
-  s:write(4, 1, 999)            -- cellule éparse
+  s:write(4, 1, 999)
   local s2 = wb:add_sheet("Autre")
   s2:write_rows({ { "a", "b" }, { 1, 2 } })
-  assert(wb:save(TMP))
+  assert(wb:save(TMP, { use_babet = false }))
 
-  local r = assert(xlsx.open(TMP))
+  local r = assert(xlsx.open(TMP, { use_babet = false }))
   check(table.concat(r:sheet_names(), ",") == "Données,Autre", "feuilles dans l'ordre")
-  local sh = r:sheet("Données")
+  check(r:date_system() == "1900", "système de dates 1900 détecté")
+  local sh = assert(r:sheet("Données"))
   check(sh:read(0, 0) == "Nom",        "string + unicode entête")
   check(sh:read(0, 1) == "Âge",        "accent préservé")
   check(sh:read(1, 0) == "Alice <x>",  "entité XML déséchappée")
@@ -73,13 +87,12 @@ do
 end
 
 -- ---- DATAFRAME -------------------------------------------------------------
-print("\n[2] dataframe : pipeline complet")
+print("\n[2] dataframe : pipeline et non-destruction")
 do
-  local r = assert(xlsx.open(TMP))
-  local d = DF.from_sheet(r:sheet("Données"), { header = true })
+  local r = assert(xlsx.open(TMP, { use_babet = false }))
+  local d = DF.from_sheet(assert(r:sheet("Données")), { header = true })
   check(d:nrow() == 4, "from_sheet : 4 lignes (dont vides)")
 
-  -- ne garder que les lignes avec un nom
   d = d:filter(function(row) return row["Nom"] ~= nil end)
   check(d:nrow() == 2, "filter : 2 lignes nommées")
 
@@ -93,32 +106,142 @@ do
   })
   check(g:nrow() == 2, "groupby Actif : 2 groupes")
 
-  -- round-trip dataframe -> xlsx -> dataframe
-  assert(xlsx.write_rows(TMP, g:to_rows(), { sheet = "g" }))
-  local back = DF.from_sheet(assert(xlsx.open(TMP)):sheet("g"), { header = true })
+  assert(xlsx.write_rows(TMP2, g:to_rows(), { sheet = "g", use_babet = false }))
+  local back = DF.from_sheet(assert(assert(xlsx.open(TMP2, { use_babet = false })):sheet("g")), { header = true })
   check(back:ncol() == 4, "round-trip : 4 colonnes (Actif + 3 agg)")
+
+  local source = DF.from_records({ { x = 2 }, { x = 1 } }, { "x" })
+  local filtered = source:filter(function() return true end)
+  filtered.rows[1].x = 99
+  check(source.rows[1].x == 2, "filter copie les records")
+  local sorted = source:sort("x")
+  sorted.rows[1].x = 88
+  check(source.rows[2].x == 1, "sort copie les records")
+  local headed = source:head(1)
+  headed.rows[1].x = 77
+  check(source.rows[1].x == 2, "head copie les records")
+  local iterrow = source:iter()()
+  iterrow.x = 66
+  check(source.rows[1].x == 2, "iter renvoie une copie")
+
+  expect_error(function()
+    DF.from_records({ { a = 1, b = 2 } }, { "a", "b" }):rename({ a = "x", b = "x" })
+  end, "rename refuse les collisions")
+  expect_error(function()
+    DF.from_rows({ { "x", "x" }, { 1, 2 } }, { header = true })
+  end, "header refuse les colonnes dupliquées")
+
+  local collision = DF.from_records({
+    { a = "x", b = "y\2string\1z" },
+    { a = "x\2string\1y", b = "z" },
+  }, { "a", "b" }):groupby("a", "b"):count()
+  check(collision:nrow() == 2, "groupby sans collision sur chaînes binaires")
 end
 
-os.remove(TMP)
-
 -- ---- DATES -----------------------------------------------------------------
-print("\n[3] dates (styles)")
+print("\n[3] dates 1900 et 1904")
 do
   local wb = xlsx.new()
   local s = wb:add_sheet("d")
   s:write(0, 0, xlsx.date(2024, 3, 15))
   s:write(1, 0, xlsx.datetime(2024, 3, 15, 13, 45, 30))
-  s:write(2, 0, 7) -- nombre normal, ne doit pas devenir une date
-  assert(wb:save(TMP))
+  s:write(2, 0, 7)
+  assert(wb:save(TMP, { use_babet = false }))
 
-  local r = assert(xlsx.open(TMP))
-  local sh = r:sheet("d")
-  check(sh:read(0, 0) == "2024-03-15",          "date -> ISO")
-  check(sh:read(1, 0) == "2024-03-15T13:45:30", "datetime -> ISO")
+  local r = assert(xlsx.open(TMP, { use_babet = false }))
+  local sh = assert(r:sheet("d"))
+  check(sh:read(0, 0) == "2024-03-15",          "date 1900 -> ISO")
+  check(sh:read(1, 0) == "2024-03-15T13:45:30", "datetime 1900 -> ISO")
   check(sh:read(2, 0) == 7,                      "nombre normal préservé")
+
+  local wb1904 = xlsx.new({ date_system = "1904" })
+  wb1904:add_sheet("d"):write(0, 0, xlsx.datetime(2024, 3, 15, 13, 45, 30))
+  assert(wb1904:save(TMP2, { use_babet = false }))
+  local r1904 = assert(xlsx.open(TMP2, { use_babet = false }))
+  check(r1904:date_system() == "1904", "système de dates 1904 détecté")
+  check(assert(r1904:sheet("d")):read(0, 0) == "2024-03-15T13:45:30",
+    "datetime 1904 correctement convertie")
+end
+
+-- ---- VALIDATIONS -----------------------------------------------------------
+print("\n[4] validations XML, feuilles, dates et limites")
+do
+  local wb = xlsx.new()
+  local long_unicode = string.rep("é", 20)
+  check(pcall(function() wb:add_sheet(long_unicode) end), "31 caractères, pas 31 octets")
+  expect_error(function() wb:add_sheet(long_unicode) end, "nom de feuille dupliqué refusé")
+  expect_error(function()
+    local x = xlsx.new(); x:add_sheet("Test"); x:add_sheet("test")
+  end, "doublon ASCII insensible à la casse refusé")
+  expect_error(function() xlsx.new():add_sheet("'interdit") end, "apostrophe initiale refusée")
+  expect_error(function() xlsx.new():add_sheet("fin'") end, "apostrophe finale refusée")
+  expect_error(function() xlsx.new():add_sheet("bad/name") end, "caractère de feuille interdit")
+  expect_error(function() xlsx.new():add_sheet("x"):write(0, 0, "a\1b") end,
+    "caractère XML 1.0 interdit refusé")
+  expect_error(function() xlsx.date(2024, 13, 1) end, "mois invalide refusé")
+  expect_error(function() xlsx.date(2023, 2, 29) end, "jour invalide refusé")
+  expect_error(function() xlsx.datetime(2024, 1, 1, 24, 0, 0) end, "heure invalide refusée")
+  expect_error(function() xlsx.new():add_sheet("x"):write(1048576, 0, 1) end,
+    "ligne hors limites Excel refusée")
+
+  local too_small, err = xlsx.open(TMP, { max_file_size = 16, use_babet = false })
+  check(too_small == nil and type(err) == "string", "max_file_size appliqué avant parsing")
+end
+
+-- ---- INTÉGRITÉ ZIP ---------------------------------------------------------
+print("\n[5] intégrité ZIP et contrat d'erreur")
+do
+  local wb = xlsx.new()
+  wb:add_sheet("x"):write(0, 0, "Alice")
+  assert(wb:save(TMP, { use_babet = false }))
+  local bytes = read_file(TMP)
+  local corrupt, n = bytes:gsub("Alice", "Alicf", 1)
+  assert(n == 1)
+  write_file(BAD, corrupt)
+  local opened, err = xlsx.open(BAD, { use_babet = false })
+  check(opened == nil and tostring(err):find("CRC%-32 invalide") ~= nil,
+    "CRC corrompu renvoyé sous forme nil, err")
+end
+
+-- ---- INTÉGRATION BABET -----------------------------------------------------
+print("\n[6] intégration Babet optionnelle")
+do
+  local original = rawget(_G, "babet")
+  local calls = { write = 0, size = 0, test = 0 }
+  _G.babet = {
+    writeFileAtomic = function(path, data, opts)
+      calls.write = calls.write + 1
+      check(opts.overwrite == true and opts.durable == true, "options writeFileAtomic transmises")
+      write_file(path, data)
+      return true, nil
+    end,
+    fileSize = function(path)
+      calls.size = calls.size + 1
+      return #read_file(path), nil
+    end,
+    archive = {
+      test = function(_path, opts)
+        calls.test = calls.test + 1
+        check(opts.max_entries ~= nil and opts.max_compression_ratio ~= nil,
+          "limites transmises à archive.test")
+        return { format = "zip" }, nil
+      end,
+    },
+  }
+
+  local wb = xlsx.new()
+  wb:add_sheet("babet"):write(0, 0, "ok")
+  local ok, save_err = wb:save(TMP2)
+  check(ok == true and save_err == nil and calls.write == 1, "save utilise writeFileAtomic")
+  local read, open_err = xlsx.open(TMP2)
+  check(read ~= nil and open_err == nil and calls.size == 1 and calls.test == 1,
+    "open utilise fileSize et archive.test")
+  _G.babet = original
 end
 
 os.remove(TMP)
+os.remove(TMP2)
+os.remove(BAD)
 
 print("\n========================================")
 if fails == 0 then

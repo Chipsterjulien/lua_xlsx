@@ -3,3 +3,5 @@
 
 # Fichiers de test/sortie éventuels
 *.tmp
+
+/bin/babet

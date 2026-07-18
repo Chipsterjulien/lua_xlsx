@@ -1,296 +1,547 @@
-# Documentation (English)
+# lua-xlsx - English documentation
 
-Complete API reference for the `xlsx` and `dataframe` modules.
+Reference for the `xlsx` and `dataframe` modules. Babet with Lua 5.5 is the
+primary target, while the pure-Lua core remains compatible with standard Lua
+5.3+.
 
+## Contents
+
+- [Architecture and Babet integration](#architecture-and-babet-integration)
 - [Conventions](#conventions)
-- [Module `xlsx` — writing](#module-xlsx--writing)
-- [Module `xlsx` — dates](#module-xlsx--dates)
-- [Module `xlsx` — reading](#module-xlsx--reading)
-- [Module `dataframe`](#module-dataframe)
-- [End-to-end example](#end-to-end-example)
+- [Writing XLSX files](#writing-xlsx-files)
+- [1900 and 1904 dates](#1900-and-1904-dates)
+- [Reading XLSX files](#reading-xlsx-files)
+- [ZIP validation and limits](#zip-validation-and-limits)
+- [DataFrame](#dataframe)
 - [Error contract](#error-contract)
-- [Limitations & internals](#limitations--internals)
+- [Tests and interoperability](#tests-and-interoperability)
+- [Building the PDFs](#building-the-pdfs)
+- [Known limitations](#known-limitations)
+
+---
+
+## Architecture and Babet integration
+
+`xlsx.lua` and `dataframe.lua` require no external Lua module. When the global
+`babet` table is available, `xlsx.lua` automatically uses:
+
+| Babet function | lua-xlsx use |
+|---|---|
+| `babet.writeFileAtomic` | atomic and durable XLSX publication |
+| `babet.archive.test` | full ZIP validation before parsing |
+| `babet.fileSize` | file-size check before loading into memory |
+| `babet.crc32` | native CRC-32 calculation |
+
+If one function is absent, the pure-Lua path is retained for that operation.
+
+To disable Babet for one call:
+
+```lua
+assert(wb:save("report.xlsx", { use_babet = false }))
+
+local read, err = xlsx.open("report.xlsx", {
+  use_babet = false,
+})
+assert(read, err)
+```
+
+This is mostly useful for testing the fallback. Production code running in
+Babet should normally keep the default `true`.
 
 ---
 
 ## Conventions
 
-- **Indices are 0-based** for `sheet:write(row, col, …)` and `sheet:read(row, col)`
-  (cell `A1` is `(0, 0)`), to keep the writer and reader symmetric.
-- The **row iterator** `sheet:rows()` yields **1-based** arrays (`row[1]` is column
-  A) because that is how Lua loops read naturally; each yielded `row` carries a
-  `.n` field with the number of columns.
-- Empty cells are `nil`.
-- Date cells are returned **as ISO 8601 strings** when reading.
-- All DataFrame operations are **non-destructive**: they return a new DataFrame.
+- `sheet:write(row, col, value)` and `sheet:read(row, col)` use **0-based**
+  indices. Cell `A1` is `(0, 0)`.
+- `sheet:rows()` yields **1-based** Lua arrays. `row[1]` is column A and `row.n`
+  is the width.
+- An empty cell is `nil`. Boolean `false` never collapses to `nil`.
+- Dates are returned as ISO 8601 strings.
+- XLSX bounds are enforced: rows `0..1048575`, columns `0..16383`.
+- Written strings must be valid UTF-8 and contain only XML 1.0 characters.
+- DataFrame transformations return newly copied row records.
 
 ---
 
-## Module `xlsx` — writing
+## Writing XLSX files
 
-### `xlsx.new() -> workbook`
+### `xlsx.new([opts]) -> workbook`
 
-Creates an empty workbook.
+Option:
+
+| Option | Default | Values |
+|---|---:|---|
+| `date_system` | `"1900"` | `"1900"` or `"1904"` |
+
+```lua
+local wb1900 = xlsx.new()
+local wb1904 = xlsx.new({ date_system = "1904" })
+```
+
+Unknown options are rejected.
 
 ### `workbook:add_sheet([name]) -> sheet`
 
-Adds a worksheet and returns it. `name` defaults to `"SheetN"`. A name must be
-1–31 characters and must not contain `: \ / ? * [ ]`.
+The default name is `SheetN`.
+
+Rules:
+
+- 1 to 31 **Unicode characters**, not bytes;
+- valid UTF-8 and XML 1.0;
+- none of `:`, `\`, `/`, `?`, `*`, `[` or `]`;
+- no leading or trailing apostrophe;
+- no exact duplicate or ASCII case-only duplicate.
+
+```lua
+local wb = xlsx.new()
+local data = wb:add_sheet("Data")
+local unicode = wb:add_sheet(string.rep("é", 20))
+```
 
 ### `sheet:write(row, col, value) -> sheet`
 
-Writes a single cell. `row` and `col` are non-negative integers (0-based).
-`value` may be a `string`, `number`, `boolean`, a **date value** (see below), or
-`nil` (empty). `NaN`/`Inf` are rejected. Returns the sheet (chainable).
-
-### `sheet:append_row(values) -> sheet`
-
-Appends a full row after the current last row. `values` is a 1-based array;
-trailing `nil`s are ignored. Returns the sheet.
-
-### `sheet:write_rows(matrix) -> sheet`
-
-Appends every row of `matrix` (an array of row arrays). Returns the sheet.
-
-### `workbook:save(path) -> true | nil, err`
-
-Writes the `.xlsx` file. Returns `true`, or `(nil, errmsg)` on I/O failure.
-If the workbook has no sheet, an empty `"Sheet1"` is created.
-
-### `xlsx.write_rows(path, matrix [, opts]) -> true | nil, err`
-
-Convenience: writes a single matrix to `path`. `opts.sheet` sets the worksheet
-name (default `"Sheet1"`).
+Accepted values: string, finite number, boolean, date value or `nil`.
 
 ```lua
-local xlsx = require("xlsx")
-local wb = xlsx.new()
-local sh = wb:add_sheet("People")
-sh:write(0, 0, "Name"); sh:write(0, 1, "Age")
-sh:append_row({ "Alice", 30 })
-sh:append_row({ "Bob", 25 })
-assert(wb:save("people.xlsx"))
+local sh = xlsx.new():add_sheet("Example")
+sh:write(0, 0, "Text")
+sh:write(0, 1, 42)
+sh:write(0, 2, 3.14)
+sh:write(0, 3, false)
+sh:write(0, 4, xlsx.date(2026, 7, 18))
+```
+
+NaN, infinities, unsupported types and out-of-range indices raise a Lua error.
+
+### `sheet:append_row(values)`
+
+```lua
+sh:append_row({ "Alice", 30, true })
+sh:append_row({ "Bob", 25, false })
+```
+
+### `sheet:write_rows(matrix)`
+
+```lua
+sh:write_rows({
+  { "Name", "Score" },
+  { "Alice", 18 },
+  { "Bob", 15 },
+})
+```
+
+### `workbook:save(path [, opts])`
+
+| Option | Default | Effect |
+|---|---:|---|
+| `overwrite` | `true` | replace an existing file |
+| `durable` | `true` | request durable synchronization in Babet |
+| `permissions` | `0644` | final Babet file mode |
+| `use_babet` | `true` | use `writeFileAtomic` when available |
+
+Simple write:
+
+```lua
+local ok, err = wb:save("report.xlsx")
+assert(ok, err)
+```
+
+Refuse overwrite:
+
+```lua
+local ok, err = wb:save("report.xlsx", {
+  overwrite = false,
+})
+```
+
+Rebuildable cache:
+
+```lua
+assert(wb:save("cache.xlsx", {
+  durable = false,
+}))
+```
+
+Private permissions:
+
+```lua
+assert(wb:save("private.xlsx", {
+  permissions = tonumber("600", 8),
+}))
+```
+
+Combined example:
+
+```lua
+local ok, err = wb:save("export/report.xlsx", {
+  overwrite = true,
+  durable = true,
+  permissions = tonumber("640", 8),
+  use_babet = true,
+})
+assert(ok, err)
+```
+
+With Babet, this calls `babet.writeFileAtomic`. Standard Lua writes a temporary
+file in the same directory, checks `write`, `flush` and `close`, then renames it.
+The fallback is atomic on ordinary POSIX filesystems but does not duplicate all
+of Babet's descriptor confinement and `fsync` guarantees.
+
+### `xlsx.write_rows(path, matrix [, opts])`
+
+Options are `sheet`, `date_system`, `overwrite`, `durable`, `permissions` and
+`use_babet`.
+
+```lua
+assert(xlsx.write_rows("result.xlsx", {
+  { "x", "y" },
+  { 1, 2 },
+  { 3, 4 },
+}, {
+  sheet = "Results",
+  date_system = "1900",
+  overwrite = true,
+}))
 ```
 
 ---
 
-## Module `xlsx` — dates
-
-Dates are written as numbers carrying a date number-format style. Use the
-constructors below as a cell value.
-
-### `xlsx.date(year, month, day) -> date value`
-
-A date displayed as `yyyy-mm-dd`. Arguments must be integers.
-
-### `xlsx.datetime(year, month, day [, hour, min, sec]) -> date value`
-
-A date-time displayed as `yyyy-mm-dd hh:mm:ss`. Time parts default to 0.
+## 1900 and 1904 dates
 
 ```lua
-sh:write(0, 0, xlsx.date(2024, 3, 15))
-sh:write(1, 0, xlsx.datetime(2024, 3, 15, 13, 45, 30))
+sh:write(0, 0, xlsx.date(2026, 7, 18))
+sh:write(0, 1, xlsx.datetime(2026, 7, 18, 13, 45, 30))
 ```
 
-When **reading**, a numeric cell whose style is a date format is returned as an
-ISO 8601 string: `"2024-03-15"` or `"2024-03-15T13:45:30"`.
+The constructors validate real calendar dates, leap years, years `1..9999`,
+hours `0..23`, minutes and seconds `0..59`, and integer argument types.
 
-### Helpers
+Helpers:
 
-- `xlsx.serial_to_iso(serial, withtime) -> string` — converts an Excel serial
-  number to ISO 8601 (`withtime` truthy adds the time part).
-- `xlsx.date_to_serial(year, month, day [, hour, min, sec]) -> number` — the
-  inverse.
+```lua
+local serial1900 = xlsx.date_to_serial(2026, 7, 18)
+local serial1904 = xlsx.date_to_serial(2026, 7, 18, 0, 0, 0, true)
 
-Dates use the Excel 1900 system with effective epoch 1899-12-30 (identical to
-openpyxl); conversion is pure integer arithmetic, independent of `os.time`/
-`os.date`, so there are no timezone or range issues.
+print(xlsx.serial_to_iso(serial1900, false))
+print(xlsx.serial_to_iso(serial1904, false, true))
+```
+
+The writer emits the correct serial for the workbook's `date_system`. The reader
+automatically detects `<workbookPr date1904="1"/>`.
 
 ---
 
-## Module `xlsx` — reading
+## Reading XLSX files
 
-### `xlsx.open(path) -> workbook | nil, err`
+### `xlsx.open(path [, opts])`
 
-Opens an `.xlsx` file for reading. Returns a read workbook, or `(nil, errmsg)`
-if the file cannot be opened or is not a valid `.xlsx`.
+Opening performs:
 
-### `workbook:sheet_names() -> { string, … }`
-
-Ordered list of worksheet names.
-
-### `workbook:sheet(which) -> sheet | nil [, err]`
-
-Returns a worksheet by **name** (string) or **1-based index** (number), or `nil`
-if not found. Sheets are parsed lazily and cached.
-
-### `sheet:read(row, col) -> value | nil`
-
-Reads one cell (0-based). Returns the value (`string`, `number`, `boolean`, or
-an ISO 8601 date string), or `nil` if empty. `false` is preserved (it does not
-collapse to `nil`).
-
-### `sheet:dims() -> maxrow, maxcol`
-
-Returns the 0-based maximum row and column indices, or `-1, -1` for an empty
-sheet.
-
-### `sheet:rows() -> iterator`
-
-Returns an iterator yielding one `row` per spreadsheet row, from row 0 to
-`maxrow` (including empty rows in the middle). Each `row` is a **1-based** array
-(`row[1]` = column A) with empty cells as `nil`, and `row.n` holds the column
-count.
+1. file-size inspection;
+2. `babet.archive.test()` validation when available;
+3. bounded in-memory loading;
+4. central and local ZIP header validation;
+5. CRC-checked extraction of the XML parts that are used;
+6. workbook, shared-string and style parsing.
 
 ```lua
-local wb = xlsx.open("people.xlsx")
-local sh = wb:sheet("People")
-print(sh:read(1, 0))                 -- "Alice"
-for row in sh:rows() do
-  for c = 1, row.n do io.write(tostring(row[c]), "\t") end
-  io.write("\n")
+local wb, err = xlsx.open("report.xlsx")
+assert(wb, err)
+```
+
+Disable only Babet's archive preflight:
+
+```lua
+local wb, err = xlsx.open("report.xlsx", {
+  validate_archive = false,
+})
+```
+
+The Lua ZIP checks still apply.
+
+### `workbook:date_system()`
+
+Returns `"1900"` or `"1904"`.
+
+### `workbook:sheet_names()`
+
+```lua
+for _, name in ipairs(wb:sheet_names()) do
+  print(name)
 end
 ```
 
+### `workbook:sheet(which)`
+
+`which` is a name or a 1-based integer index.
+
+```lua
+local first = wb:sheet(1)
+local data = wb:sheet("Data")
+```
+
+Worksheets are extracted lazily and cached. A worksheet-specific corruption is
+therefore returned by `sheet()` as `nil, err`.
+
+### `sheet:read(row, col)`
+
+Returns a string, number, boolean, ISO date string or `nil`. OOXML error cells
+are currently returned as strings.
+
+### `sheet:dims()`
+
+Returns maximum 0-based row and column indices, or `-1, -1` for an empty sheet.
+
+### `sheet:rows()`
+
+```lua
+for row in sheet:rows() do
+  for col = 1, row.n do
+    print(row[col])
+  end
+end
+```
+
+Intermediate empty spreadsheet rows are yielded to preserve row numbering.
+
 ---
 
-## Module `dataframe`
+## ZIP validation and limits
 
-A DataFrame holds an ordered list of column names and a list of row records
-(each a table mapping name → value).
+| Option | Default | Maximum |
+|---|---:|---:|
+| `max_file_size` | 256 MiB | no extra internal ceiling |
+| `max_entries` | 10,000 | 100,000 |
+| `max_entry_size` | 64 MiB | 8 GiB |
+| `max_total_size` | 512 MiB | 64 GiB |
+| `max_path_length` | 4,096 bytes | 1 MiB |
+| `max_total_name_bytes` | 16 MiB | 64 MiB |
+| `max_compression_ratio` | 200 | 1,000,000,000 |
+| `use_babet` | `true` | boolean |
+| `validate_archive` | `true` | boolean |
+
+One example per limit:
+
+```lua
+xlsx.open("a.xlsx", { max_file_size = 32 * 1024 * 1024 })
+xlsx.open("a.xlsx", { max_entries = 2000 })
+xlsx.open("a.xlsx", { max_entry_size = 16 * 1024 * 1024 })
+xlsx.open("a.xlsx", { max_total_size = 128 * 1024 * 1024 })
+xlsx.open("a.xlsx", { max_path_length = 1024 })
+xlsx.open("a.xlsx", { max_total_name_bytes = 1024 * 1024 })
+xlsx.open("a.xlsx", { max_compression_ratio = 100 })
+```
+
+Combined untrusted-file profile:
+
+```lua
+local wb, err = xlsx.open("import.xlsx", {
+  max_file_size = 64 * 1024 * 1024,
+  max_entries = 5000,
+  max_entry_size = 16 * 1024 * 1024,
+  max_total_size = 128 * 1024 * 1024,
+  max_path_length = 2048,
+  max_total_name_bytes = 2 * 1024 * 1024,
+  max_compression_ratio = 100,
+  use_babet = true,
+  validate_archive = true,
+})
+assert(wb, err)
+```
+
+The Lua reader rejects multi-disk ZIPs, ZIP64, encryption, unsupported methods,
+unsafe or duplicate names, inconsistent local headers or data descriptors,
+overlapping entries, size mismatches, CRC failures and truncated DEFLATE data.
+
+---
+
+## DataFrame
+
+A DataFrame contains unique, non-empty string `columns` and `rows` records.
 
 ### Construction
 
-#### `df.from_rows(matrix [, opts]) -> DataFrame`
+#### `DF.from_rows(matrix [, opts])`
 
-Builds from a matrix (array of 1-based row arrays, optionally carrying `.n`).
-`opts.header = true` uses the first row as column names; `opts.columns` supplies
-explicit names; otherwise columns are named `col1`…`colN`.
+`opts.header` uses the first row as names. `opts.columns` supplies explicit
+names when `header` is false.
 
-#### `df.from_records(records [, columns]) -> DataFrame`
+```lua
+local d = DF.from_rows({
+  { "name", "age" },
+  { "Alice", 30 },
+  { "Bob", 25 },
+}, { header = true })
+```
 
-Builds from an array of records (name → value tables). Passing `columns` is
-recommended to fix the order; otherwise columns are inferred and sorted.
+Duplicate column names are rejected.
 
-#### `df.from_sheet(sheet [, opts]) -> DataFrame`
+#### `DF.from_records(records [, columns])`
 
-Convenience: consumes an `xlsx` reader sheet via `sheet:rows()`. `opts` are the
-same as `from_rows` (typically `{ header = true }`).
+```lua
+local d = DF.from_records({
+  { name = "Alice", age = 30 },
+  { name = "Bob", age = 25 },
+}, { "name", "age" })
+```
+
+Without `columns`, string keys are inferred and sorted.
+
+#### `DF.from_sheet(sheet [, opts])`
+
+```lua
+local d = DF.from_sheet(assert(wb:sheet("Data")), {
+  header = true,
+})
+```
 
 ### Introspection
 
-- `df:nrow() -> integer` — number of rows.
-- `df:ncol() -> integer` — number of columns.
-- `df:colnames() -> { string, … }` — ordered column names.
-- `df:column(name) -> { value, … }` — values of one column.
-- `df:iter() -> iterator` — iterates over records (name → value tables).
+```lua
+print(d:nrow(), d:ncol())
+print(table.concat(d:colnames(), ", "))
+local ages = d:column("age")
+```
 
-### Transformations (each returns a new DataFrame)
-
-- `df:filter(pred)` — keeps rows where `pred(row)` is truthy.
-- `df:select(...)` — projects a subset of columns, in the given order. Accepts
-  multiple names or a single array.
-- `df:rename(map)` — renames columns according to `{ old = new }`.
-- `df:mutate(name, fn)` — adds or replaces a computed column: `value = fn(row)`.
-- `df:sort(col [, opts])` — stable sort by `col`; `opts.desc = true` for
-  descending. `nil` values always sort last.
-- `df:head([n])` / `df:tail([n])` — first/last `n` rows (default 5).
-
-### Grouping & aggregation
-
-#### `df:groupby(...) -> GroupBy`
-
-Groups by one or more columns (multiple names or a single array).
-
-#### `groupby:agg(spec) -> DataFrame`
-
-`spec` is `{ output_name = { func, source_col }, … }`. Functions: `sum`,
-`mean` (alias `avg`), `min`, `max`, `count`, `first`, `last`. `"count"` without a
-column counts rows in the group. Output columns are the group keys first, then
-the aggregates **sorted by name** (deterministic). Group order follows first
-appearance.
-
-#### `groupby:count() -> DataFrame`
-
-Shortcut for the number of rows per group, in a column named `n`.
+`d:iter()` yields copies:
 
 ```lua
-local g = d:groupby("city", "product"):agg({
+for row in d:iter() do
+  row.age = 0 -- does not modify d
+end
+```
+
+### Non-destructive transformations
+
+```lua
+local adults = d:filter(function(row) return row.age >= 18 end)
+local names = d:select("name")
+local renamed = d:rename({ age = "years" })
+local doubled = d:mutate("double_age", function(row) return row.age * 2 end)
+local asc = d:sort("age")
+local desc = d:sort("age", { desc = true })
+local first = d:head(10)
+local last = d:tail(10)
+```
+
+`filter` and `mutate` callbacks receive a copy. `filter`, `sort`, `head`, `tail`
+and `iter` do not share row tables with the source. Rename collisions and
+repeated selections are rejected. Sort is stable and keeps `nil` last.
+
+### Grouping and aggregation
+
+```lua
+local grouped = sales:groupby("city", "product"):agg({
   total = { "sum", "amount" },
-  avg   = { "mean", "amount" },
-  n     = { "count" },
+  average = { "mean", "amount" },
+  minimum = { "min", "amount" },
+  maximum = { "max", "amount" },
+  first = { "first", "amount" },
+  last = { "last", "amount" },
+  count = { "count" },
 })
+```
+
+Functions: `sum`, `mean`/`avg`, `min`, `max`, `count`, `first`, `last`.
+
+Group keys support nil, booleans, binary strings and numbers. The internal key
+encoding is type- and length-prefixed, so embedded separators or NUL bytes cannot
+merge distinct groups.
+
+```lua
+local counts = d:groupby("city"):count()
 ```
 
 ### Output
 
-- `df:to_records() -> { record, … }` — array of name → value tables.
-- `df:to_rows([opts]) -> matrix` — array of 1-based row arrays, directly usable by
-  `xlsx.write_rows`. A header row is included unless `opts.header == false`.
-- `df:tostring([n]) -> string` — an ASCII table of the first `n` rows (default 20).
-- `df:show([n]) -> df` — prints `tostring(n)`; returns the DataFrame (chainable).
-
----
-
-## End-to-end example
-
 ```lua
-local xlsx = require("xlsx")
-local DF   = require("dataframe")
-
--- read a real .xlsx (DEFLATE-compressed by Excel/LibreOffice/pandas)
-local wb = assert(xlsx.open("sales.xlsx"))
-local d  = DF.from_sheet(wb:sheet("sales"), { header = true })
-
--- transform
-local summary = d
-  :mutate("total", function(r) return r.qty * r.price end)
-  :filter(function(r) return r.total >= 30 end)
-  :groupby("city")
-  :agg({ total = { "sum", "total" }, n = { "count" } })
-  :sort("total", { desc = true })
-
-summary:show()
-
--- write the result back to a new workbook
-assert(xlsx.write_rows("summary.xlsx", summary:to_rows(), { sheet = "summary" }))
+local records = d:to_records()
+local rows = d:to_rows()
+local no_header = d:to_rows({ header = false })
+print(d:tostring(20))
+d:show(20)
 ```
 
 ---
 
 ## Error contract
 
-- **Bad argument types** (e.g. a non-integer row index, a table where a string is
-  expected) raise an error via `error()` — these are caller bugs.
-- **Runtime failures** during reading/writing return `(nil, "xlsx: …")`:
-  file cannot be opened, not a valid ZIP/`.xlsx`, missing required part,
-  unsupported compression method, truncated/corrupt DEFLATE stream.
-- HTTP-style "the operation worked but the data is unusual" cases are not errors:
-  an empty sheet reads back as a sheet with `dims() == -1, -1`.
+Caller mistakes raise Lua errors: invalid types or options, invalid names or
+dates, out-of-range indices and inconsistent DataFrame operations.
+
+Filesystem and data failures normally return `nil, err`:
+
+```lua
+local wb, err = xlsx.open("missing.xlsx")
+if not wb then
+  io.stderr:write(err, "\n")
+end
+```
+
+`workbook:sheet()` follows the same convention for a corrupt or missing sheet
+part. `Workbook:save()` checks writing, flushing, closing and publication and no
+longer reports success after a real write failure.
 
 ---
 
-## Limitations & internals
+## Tests and interoperability
 
-**Writing** produces an uncompressed (STORED) ZIP. This needs no compressor and
-is read correctly by Excel, LibreOffice and openpyxl. Each entry's CRC-32 is
-computed in pure Lua.
+```sh
+./run_tests.sh
+```
 
-**Reading** parses the ZIP central directory and inflates entries with a complete
-**pure-Lua DEFLATE decoder** (RFC 1951: stored, fixed and dynamic Huffman blocks,
-and LZ77 back-references). XML is parsed with lightweight, xlsx-specific pattern
-scanning rather than a general XML parser.
+The harness covers write/read round trips, Unicode, XML entities, CRC corruption,
+1900/1904 dates, Excel and XML limits, Babet calls, DataFrame copy semantics,
+collision-free grouping and real openpyxl interoperability.
 
-**Out of scope** (additive later): visual styles (bold, colours, borders),
-formulas (the cached value is read, not the formula), merged cells, a streaming
-reader for very large files, and a SQLite bridge for heavy queries.
+Babet is resolved in this order: `BABET_BIN`, the local `bin/babet` file, then
+`babet` from `PATH`. The harness creates a temporary Python virtual environment,
+installs `openpyxl>=3.1,<4`, runs the interoperability round trip separately with
+Babet and standard Lua when both are available, and removes the venv, pip cache
+and temporary files at exit, including after a failure. A global openpyxl
+installation is neither used nor required.
 
-**Memory:** the inflater accumulates decompressed bytes in memory before turning
-them into a string. This is fine for thousands–tens of thousands of rows; for
-hundreds of MB of decompressed data a sliding-window flush would be the natural
-optimization.
+This phase requires `python3`, the `venv` module, pip inside the venv and access
+to the configured Python package index. Debian and Ubuntu systems may need the
+`python3-venv` package.
 
-**Compatibility:** the modules use only the Lua standard library and require Lua
-5.3+ (bitwise operators, `string.pack`/`unpack`, `math.type`, `utf8.char`,
-integer `//`). They have **no dependency on LuaPilot**; LuaPilot is simply a
-convenient Lua 5.5 host.
+```sh
+cp /path/to/babet bin/babet
+chmod +x bin/babet
+./run_tests.sh
+
+BABET_BIN=../babet/bin/babet ./run_tests.sh
+LUA_BIN=/usr/bin/lua5.5 ./run_tests.sh
+OPENPYXL_SPEC='openpyxl==3.1.5' ./run_tests.sh
+```
+
+---
+
+## Building the PDFs
+
+```sh
+cd doc
+./build_doc.sh
+```
+
+Outputs:
+
+- `documentation-fr.pdf`;
+- `documentation-en.pdf`.
+
+Pandoc and XeLaTeX or LuaLaTeX are required. Auxiliary LaTeX files are kept in a
+temporary directory.
+
+---
+
+## Known limitations
+
+- Writing uses STORED ZIP entries; reading supports STORED and DEFLATE.
+- The internal Lua parser does not support ZIP64.
+- No general visual styling, merged cells or formula writing.
+- A formula's cached value can be read.
+- No streaming reader: the file and selected XML parts remain in memory.
+- The XML scanner is XLSX-specific, not a general XML parser.
+- No Unicode normalization or complete Unicode case folding for sheet names;
+  case-insensitive duplicate detection is reliable for ASCII.

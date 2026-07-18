@@ -14,7 +14,7 @@
 -- along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 --- dataframe.lua — manipulation tabulaire type "pandas", en Lua pur.
---- Cible : LuaPilot (Lua 5.5). Aucune dépendance (ni C, ni SQLite).
+--- Cible principale : Babet (Lua 5.5). Compatible Lua standard 5.3+.
 --- S'interface avec le module xlsx : xlsx (lecture) -> dataframe -> xlsx (écriture).
 ---
 --- Modèle : un DataFrame porte `columns` (liste ordonnée de noms) et `rows`
@@ -30,6 +30,39 @@ local function make(columns, rows)
   return setmetatable({ columns = columns, rows = rows }, DataFrame)
 end
 
+local function validate_columns(columns, level)
+  if type(columns) ~= "table" then error("dataframe: columns doit être une table", level or 3) end
+  local n, count, seen, out = #columns, 0, {}, {}
+  for k in pairs(columns) do
+    if math.type(k) ~= "integer" or k < 1 or k > n then
+      error("dataframe: columns doit être un tableau dense", level or 3)
+    end
+    count = count + 1
+  end
+  if count ~= n then error("dataframe: columns doit être un tableau dense", level or 3) end
+  for i = 1, n do
+    local name = columns[i]
+    if type(name) ~= "string" or name == "" then
+      error("dataframe: chaque nom de colonne doit être une chaîne non vide", level or 3)
+    end
+    if seen[name] then error("dataframe: colonne dupliquée : " .. name, level or 3) end
+    seen[name], out[i] = true, name
+  end
+  return out
+end
+
+local function copy_record(columns, row)
+  local out = {}
+  for _, c in ipairs(columns) do out[c] = row[c] end
+  return out
+end
+
+local function copy_rows(columns, rows)
+  local out = {}
+  for i, row in ipairs(rows) do out[i] = copy_record(columns, row) end
+  return out
+end
+
 -- ----------------------------------------------------------------------------
 -- Construction
 -- ----------------------------------------------------------------------------
@@ -40,32 +73,39 @@ end
 --- opts.columns : noms explicites (sinon "col1".."colN").
 function df.from_rows(matrix, opts)
   opts = opts or {}
-  if type(matrix) ~= "table" then
-    error("dataframe: from_rows attend une table de lignes", 2)
+  if type(matrix) ~= "table" then error("dataframe: from_rows attend une table de lignes", 2) end
+  if type(opts) ~= "table" then error("dataframe: from_rows attend une table d'options", 2) end
+  for k in pairs(opts) do
+    if k ~= "header" and k ~= "columns" then error("dataframe: option inconnue pour from_rows : " .. tostring(k), 2) end
   end
-  local start = 1
-  local cols = opts.columns
+  if opts.header ~= nil and type(opts.header) ~= "boolean" then error("dataframe: header doit être un booléen", 2) end
+  local start_row, cols = 1, opts.columns
   if opts.header then
     local hdr = matrix[1]
-    if not hdr then error("dataframe: header demandé mais matrice vide", 2) end
+    if type(hdr) ~= "table" then error("dataframe: header demandé mais matrice vide ou invalide", 2) end
     cols = {}
     local w = hdr.n or #hdr
+    if math.type(w) ~= "integer" or w < 0 then error("dataframe: largeur de header invalide", 2) end
     for i = 1, w do
       local h = hdr[i]
-      cols[i] = (h == nil) and ("col" .. i) or tostring(h)
+      cols[i] = h == nil and ("col" .. i) or tostring(h)
     end
-    start = 2
+    start_row = 2
+  elseif cols then
+    cols = validate_columns(cols, 3)
   end
   if not cols then
-    local first = matrix[start] or {}
+    local first = matrix[start_row] or {}
+    if type(first) ~= "table" then error("dataframe: chaque ligne doit être une table", 2) end
     local w = first.n or #first
     cols = {}
     for i = 1, w do cols[i] = "col" .. i end
   end
-  local ncol = #cols
-  local rows = {}
-  for i = start, #matrix do
+  cols = validate_columns(cols, 3)
+  local ncol, rows = #cols, {}
+  for i = start_row, #matrix do
     local src = matrix[i]
+    if type(src) ~= "table" then error("dataframe: chaque ligne doit être une table", 2) end
     local r = {}
     for c = 1, ncol do r[cols[c]] = src[c] end
     rows[#rows + 1] = r
@@ -76,32 +116,35 @@ end
 --- À partir d'une liste de records (tables nom -> valeur).
 --- columns : ordre des colonnes (recommandé ; sinon déduit puis trié).
 function df.from_records(records, columns)
-  if type(records) ~= "table" then
-    error("dataframe: from_records attend une table de records", 2)
-  end
+  if type(records) ~= "table" then error("dataframe: from_records attend une table de records", 2) end
   local cols = columns
   if not cols then
     cols = {}
     local seen = {}
-    for _, rec in ipairs(records) do
+    for i, rec in ipairs(records) do
+      if type(rec) ~= "table" then error("dataframe: record " .. i .. " invalide", 2) end
       for k in pairs(rec) do
+        if type(k) ~= "string" or k == "" then error("dataframe: les noms de colonnes doivent être des chaînes non vides", 2) end
         if not seen[k] then seen[k] = true; cols[#cols + 1] = k end
       end
     end
     table.sort(cols)
   end
+  cols = validate_columns(cols, 3)
   local rows = {}
   for i = 1, #records do
     local rec = records[i]
-    local r = {}
-    for _, c in ipairs(cols) do r[c] = rec[c] end
-    rows[i] = r
+    if type(rec) ~= "table" then error("dataframe: record " .. i .. " invalide", 2) end
+    rows[i] = copy_record(cols, rec)
   end
   return make(cols, rows)
 end
 
 --- Pratique : depuis une feuille du lecteur xlsx (utilise sheet:rows()).
 function df.from_sheet(sheet, opts)
+  if type(sheet) ~= "table" or type(sheet.rows) ~= "function" then
+    error("dataframe: from_sheet attend une feuille xlsx", 2)
+  end
   local matrix = {}
   for row in sheet:rows() do matrix[#matrix + 1] = row end
   return df.from_rows(matrix, opts)
@@ -130,10 +173,11 @@ end
 
 --- Itérateur sur les records (chaque valeur produite est une table nom->valeur).
 function DataFrame:iter()
-  local i, rows = 0, self.rows
+  local i, rows, columns = 0, self.rows, self.columns
   return function()
     i = i + 1
-    return rows[i]
+    local row = rows[i]
+    return row and copy_record(columns, row) or nil
   end
 end
 
@@ -158,7 +202,8 @@ function DataFrame:filter(pred)
   end
   local out = {}
   for _, r in ipairs(self.rows) do
-    if pred(r) then out[#out + 1] = r end
+    local candidate = copy_record(self.columns, r)
+    if pred(candidate) then out[#out + 1] = candidate end
   end
   return make(self:colnames(), out)
 end
@@ -167,10 +212,9 @@ end
 function DataFrame:select(...)
   local cols = { ... }
   if #cols == 1 and type(cols[1]) == "table" then cols = cols[1] end
+  cols = validate_columns(cols, 3)
   for _, c in ipairs(cols) do
-    if not self:_has(c) then
-      error("dataframe: colonne inconnue : " .. tostring(c), 2)
-    end
+    if not self:_has(c) then error("dataframe: colonne inconnue : " .. tostring(c), 2) end
   end
   local out = {}
   for i, r in ipairs(self.rows) do
@@ -184,8 +228,17 @@ end
 --- Renomme des colonnes selon map = { ancien = nouveau }.
 function DataFrame:rename(map)
   if type(map) ~= "table" then error("dataframe: rename attend une table", 2) end
+  for old, new in pairs(map) do
+    if type(old) ~= "string" or not self:_has(old) then
+      error("dataframe: colonne à renommer inconnue : " .. tostring(old), 2)
+    end
+    if type(new) ~= "string" or new == "" then
+      error("dataframe: le nouveau nom doit être une chaîne non vide", 2)
+    end
+  end
   local newcols = {}
   for i, c in ipairs(self.columns) do newcols[i] = map[c] or c end
+  newcols = validate_columns(newcols, 3)
   local out = {}
   for i, r in ipairs(self.rows) do
     local nr = {}
@@ -197,8 +250,8 @@ end
 
 --- Ajoute (ou remplace) une colonne calculée : value = fn(row).
 function DataFrame:mutate(name, fn)
-  if type(name) ~= "string" then
-    error("dataframe: mutate attend un nom de colonne (string)", 2)
+  if type(name) ~= "string" or name == "" then
+    error("dataframe: mutate attend un nom de colonne non vide", 2)
   end
   if type(fn) ~= "function" then
     error("dataframe: mutate attend une fonction", 2)
@@ -209,7 +262,7 @@ function DataFrame:mutate(name, fn)
   for i, r in ipairs(self.rows) do
     local nr = {}
     for _, c in ipairs(self.columns) do nr[c] = r[c] end
-    nr[name] = fn(r)
+    nr[name] = fn(copy_record(self.columns, r))
     out[i] = nr
   end
   return make(cols, out)
@@ -229,6 +282,9 @@ end
 --- les valeurs nil vont toujours en dernier.
 function DataFrame:sort(col, opts)
   opts = opts or {}
+  if type(opts) ~= "table" then error("dataframe: sort attend une table d'options", 2) end
+  for k in pairs(opts) do if k ~= "desc" then error("dataframe: option inconnue pour sort : " .. tostring(k), 2) end end
+  if opts.desc ~= nil and type(opts.desc) ~= "boolean" then error("dataframe: desc doit être un booléen", 2) end
   if not self:_has(col) then
     error("dataframe: colonne inconnue : " .. tostring(col), 2)
   end
@@ -249,23 +305,31 @@ function DataFrame:sort(col, opts)
     return c < 0
   end)
   local out = {}
-  for i = 1, #idx do out[i] = rows[idx[i]] end
+  for i = 1, #idx do out[i] = copy_record(self.columns, rows[idx[i]]) end
   return make(self:colnames(), out)
 end
 
 local function slice(self, from, to)
   local out = {}
-  for i = from, to do out[#out + 1] = self.rows[i] end
+  for i = from, to do
+    if self.rows[i] then out[#out + 1] = copy_record(self.columns, self.rows[i]) end
+  end
   return make(self:colnames(), out)
 end
 
-function DataFrame:head(n)
+local function checked_count(n, what)
   n = n or 5
+  if math.type(n) ~= "integer" or n < 0 then error("dataframe: " .. what .. " attend un entier >= 0", 3) end
+  return n
+end
+
+function DataFrame:head(n)
+  n = checked_count(n, "head")
   return slice(self, 1, math.min(n, #self.rows))
 end
 
 function DataFrame:tail(n)
-  n = n or 5
+  n = checked_count(n, "tail")
   return slice(self, math.max(1, #self.rows - n + 1), #self.rows)
 end
 
@@ -330,6 +394,7 @@ function DataFrame:groupby(...)
   local keys = { ... }
   if #keys == 1 and type(keys[1]) == "table" then keys = keys[1] end
   if #keys == 0 then error("dataframe: groupby requiert au moins une colonne", 2) end
+  keys = validate_columns(keys, 3)
   for _, k in ipairs(keys) do
     if not self:_has(k) then
       error("dataframe: colonne de groupe inconnue : " .. tostring(k), 2)
@@ -347,8 +412,13 @@ function GroupBy:agg(spec)
   local d = self._df
   local keys = self._keys
 
-  local aggnames = {}
-  for name in pairs(spec) do aggnames[#aggnames + 1] = name end
+  local aggnames, keyset = {}, {}
+  for _, key in ipairs(keys) do keyset[key] = true end
+  for name in pairs(spec) do
+    if type(name) ~= "string" or name == "" then error("dataframe: nom d'agrégat invalide", 2) end
+    if keyset[name] then error("dataframe: agrégat en collision avec une clé de groupe : " .. name, 2) end
+    aggnames[#aggnames + 1] = name
+  end
   table.sort(aggnames)
 
   for _, name in ipairs(aggnames) do
@@ -364,13 +434,23 @@ function GroupBy:agg(spec)
     end
   end
 
+  local function keypart(v)
+    local tv = type(v)
+    if tv == "nil" then return "N" end
+    if tv == "boolean" then return v and "B1" or "B0" end
+    if tv == "string" then return "S" .. #v .. ":" .. v end
+    if tv == "number" then
+      local iv = math.tointeger(v)
+      if iv ~= nil then return "I" .. tostring(iv) .. ";" end
+      return "F" .. string.pack(">d", v)
+    end
+    error("dataframe: type non supporté pour une clé de groupe : " .. tv, 0)
+  end
+
   local function keystr(row)
     local parts = {}
-    for i, k in ipairs(keys) do
-      local v = row[k]
-      parts[i] = type(v) .. "\1" .. tostring(v)
-    end
-    return table.concat(parts, "\2")
+    for i, k in ipairs(keys) do parts[i] = keypart(row[k]) end
+    return table.concat(parts)
   end
 
   local order, groups = {}, {}
