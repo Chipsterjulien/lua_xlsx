@@ -21,7 +21,7 @@
 --- d'archive et d'écriture atomique. Sans Babet, un chemin de repli Lua pur
 --- conserve l'API et applique ses propres contrôles de taille, CRC et ZIP.
 
-local xlsx = { VERSION = "1.3.0" }
+local xlsx = { VERSION = "1.4.0" }
 
 local function get_babet()
   local runtime = rawget(_G, "babet")
@@ -886,6 +886,16 @@ local function new_sheet(name, workbook)
     data_validations = {},
     conditional_formats = {},
     comments = {},
+    images = {},
+    charts = {},
+    tables = {},
+    page_margins = nil,
+    page_setup = nil,
+    print_options = nil,
+    header_footer = nil,
+    _print_area = nil,
+    _repeat_rows = nil,
+    _repeat_cols = nil,
     maxrow = -1,
     maxcol = -1,
     _workbook = workbook,
@@ -1078,6 +1088,274 @@ function Sheet:unmerge_cells(ref)
   error("xlsx: fusion introuvable : " .. normalized, 2)
 end
 
+
+local validate_optional_text
+
+-- ----------------------------------------------------------------------------
+-- Images, graphiques, tableaux et mise en page d'impression
+-- ----------------------------------------------------------------------------
+local function read_binary_file(path, level)
+  if type(path) ~= "string" or path == "" then error("xlsx: le chemin d'image doit être une string non vide", level or 3) end
+  local f, err = io.open(path, "rb")
+  if not f then error("xlsx: impossible d'ouvrir l'image : " .. tostring(err), level or 3) end
+  local data, rerr = f:read("a")
+  local ok, cerr = f:close()
+  if data == nil then error("xlsx: impossible de lire l'image : " .. tostring(rerr), level or 3) end
+  if ok == nil then error("xlsx: impossible de fermer l'image : " .. tostring(cerr), level or 3) end
+  return data
+end
+
+local function image_info(data, requested, level)
+  if type(data) ~= "string" or #data == 0 then error("xlsx: les données d'image doivent être une string binaire non vide", level or 3) end
+  local format, width, height
+  if data:sub(1,8) == "\137PNG\r\n\26\n" and #data >= 24 then
+    format = "png"
+    width = string.unpack(">I4", data, 17)
+    height = string.unpack(">I4", data, 21)
+  elseif data:sub(1,2) == "\255\216" then
+    format = "jpeg"
+    local pos = 3
+    while pos + 8 <= #data do
+      if data:byte(pos) ~= 0xFF then pos = pos + 1 else
+        while pos <= #data and data:byte(pos) == 0xFF do pos = pos + 1 end
+        local marker_byte = data:byte(pos); pos = pos + 1
+        if not marker_byte then break end
+        if marker_byte ~= 0xD8 and marker_byte ~= 0xD9 and marker_byte ~= 0x01 and not (marker_byte >= 0xD0 and marker_byte <= 0xD7) then
+          if pos + 1 > #data then break end
+          local length = string.unpack(">I2", data, pos)
+          if length < 2 or pos + length - 1 > #data then break end
+          if (marker_byte >= 0xC0 and marker_byte <= 0xC3) or (marker_byte >= 0xC5 and marker_byte <= 0xC7)
+              or (marker_byte >= 0xC9 and marker_byte <= 0xCB) or (marker_byte >= 0xCD and marker_byte <= 0xCF) then
+            height = string.unpack(">I2", data, pos + 3)
+            width = string.unpack(">I2", data, pos + 5)
+            break
+          end
+          pos = pos + length
+        end
+      end
+    end
+  end
+  if requested ~= nil then
+    if type(requested) ~= "string" then error("xlsx: format d'image doit être une string", level or 3) end
+    requested = requested:lower():gsub("^jpg$", "jpeg")
+    if requested ~= "png" and requested ~= "jpeg" then error("xlsx: format d'image doit valoir png, jpeg ou jpg", level or 3) end
+    if format and requested ~= format then error("xlsx: le format annoncé ne correspond pas aux données de l'image", level or 3) end
+    format = requested
+  end
+  if not format then error("xlsx: seules les images PNG et JPEG sont prises en charge", level or 3) end
+  if not width or not height or width < 1 or height < 1 then error("xlsx: dimensions d'image invalides ou introuvables", level or 3) end
+  return format, width, height
+end
+
+local function normalize_image_opts(opts, natural_width, natural_height, level)
+  opts = opts or {}
+  if type(opts) ~= "table" then error("xlsx: les options d'image doivent être une table", level or 3) end
+  local allowed = { width=true, height=true, alt_text=true, name=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option d'image inconnue : " .. tostring(k), level or 3) end end
+  local width, height = opts.width, opts.height
+  if width ~= nil then check_finite_number(width, "largeur d'image", 1, 10000, level or 3) end
+  if height ~= nil then check_finite_number(height, "hauteur d'image", 1, 10000, level or 3) end
+  if width and not height then height = natural_height * width / natural_width end
+  if height and not width then width = natural_width * height / natural_height end
+  width, height = width or natural_width, height or natural_height
+  local alt_text = validate_optional_text(opts.alt_text, "texte alternatif", 1000, level or 3)
+  local name = validate_optional_text(opts.name, "nom d'image", 255, level or 3)
+  return { width=width, height=height, alt_text=alt_text, name=name }
+end
+
+--- Ajoute une image PNG/JPEG lue depuis un fichier, ancrée à une cellule 0-indexée.
+function Sheet:add_image(path, row, col, opts)
+  check_index(row, "row", 3); check_index(col, "col", 3)
+  local data = read_binary_file(path, 3)
+  local format, natural_width, natural_height = image_info(data, nil, 3)
+  local normalized = normalize_image_opts(opts, natural_width, natural_height, 3)
+  normalized.data, normalized.format, normalized.row, normalized.col = data, format, row, col
+  self.images[#self.images + 1] = normalized
+  return self
+end
+
+--- Ajoute directement une image binaire PNG/JPEG.
+function Sheet:add_image_data(data, format, row, col, opts)
+  check_index(row, "row", 3); check_index(col, "col", 3)
+  local detected, natural_width, natural_height = image_info(data, format, 3)
+  local normalized = normalize_image_opts(opts, natural_width, natural_height, 3)
+  normalized.data, normalized.format, normalized.row, normalized.col = data, detected, row, col
+  self.images[#self.images + 1] = normalized
+  return self
+end
+
+function Sheet:remove_image(index)
+  if math.type(index) ~= "integer" or index < 1 or not self.images[index] then error("xlsx: index d'image invalide", 2) end
+  table.remove(self.images, index); return self
+end
+
+local CHART_TYPES = { line=true, column=true, bar=true }
+local function absolute_a1_range(ref, what, level)
+  local r1, c1, r2, c2 = parse_a1_range(ref, what, true, level or 3)
+  return "$" .. col_ref(c1) .. "$" .. (r1 + 1) .. ":$" .. col_ref(c2) .. "$" .. (r2 + 1)
+end
+local function quote_sheet_name(name)
+  return "'" .. name:gsub("'", "''") .. "'"
+end
+local function chart_formula(sheet, ref, what, level)
+  return quote_sheet_name(sheet.name) .. "!" .. absolute_a1_range(ref, what, level or 3)
+end
+local function normalize_chart(opts, sheet, level)
+  if type(opts) ~= "table" then error("xlsx: add_chart attend une table d'options", level or 3) end
+  local allowed = { type=true, title=true, categories=true, series=true, row=true, col=true, width=true, height=true, legend=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option de graphique inconnue : " .. tostring(k), level or 3) end end
+  local kind = opts.type or "column"
+  if not CHART_TYPES[kind] then error("xlsx: type de graphique doit valoir line, column ou bar", level or 3) end
+  local row, col = opts.row or 0, opts.col or 0
+  check_index(row, "row", level or 3); check_index(col, "col", level or 3)
+  local width, height = opts.width or 640, opts.height or 360
+  check_finite_number(width, "largeur de graphique", 100, 2000, level or 3)
+  check_finite_number(height, "hauteur de graphique", 100, 2000, level or 3)
+  local title = validate_optional_text(opts.title, "titre de graphique", 1000, level or 3)
+  local categories = chart_formula(sheet, opts.categories, "catégories du graphique", level or 3)
+  local n = dense_array(opts.series, "séries du graphique", level or 3)
+  if n < 1 or n > 255 then error("xlsx: un graphique doit contenir entre 1 et 255 séries", level or 3) end
+  local series = {}
+  for i, src in ipairs(opts.series) do
+    if type(src) ~= "table" then error("xlsx: chaque série doit être une table", level or 3) end
+    for k in pairs(src) do if k ~= "name" and k ~= "name_ref" and k ~= "values" then error("xlsx: option de série inconnue : " .. tostring(k), level or 3) end end
+    if src.name ~= nil and src.name_ref ~= nil then error("xlsx: une série ne peut pas avoir name et name_ref", level or 3) end
+    local item = { values=chart_formula(sheet, src.values, "valeurs de série", level or 3) }
+    if src.name ~= nil then item.name = validate_optional_text(src.name, "nom de série", 255, level or 3) end
+    if src.name_ref ~= nil then item.name_ref = chart_formula(sheet, src.name_ref, "nom de série", level or 3) end
+    series[i] = item
+  end
+  if opts.legend ~= nil and type(opts.legend) ~= "boolean" then error("xlsx: legend doit être un booléen", level or 3) end
+  return { type=kind, title=title, categories=categories, series=series, row=row, col=col, width=width, height=height, legend=opts.legend ~= false }
+end
+
+--- Ajoute un graphique line, column ou bar.
+function Sheet:add_chart(opts)
+  self.charts[#self.charts + 1] = normalize_chart(opts, self, 3)
+  return self
+end
+function Sheet:remove_chart(index)
+  if math.type(index) ~= "integer" or index < 1 or not self.charts[index] then error("xlsx: index de graphique invalide", 2) end
+  table.remove(self.charts, index); return self
+end
+
+local function validate_table_name(name, level)
+  if type(name) ~= "string" or name == "" then error("xlsx: le nom de tableau doit être une string non vide", level or 3) end
+  validate_xml_text(name, "nom de tableau", level or 3)
+  if #name > 255 or not name:match("^[A-Za-z_][A-Za-z0-9_.]*$") or name:match("^[A-Za-z]+%d+$") then
+    error("xlsx: nom de tableau invalide", level or 3)
+  end
+  return name
+end
+local function normalize_table(sheet, ref, opts, level)
+  local r1, c1, r2, c2, normalized = parse_a1_range(ref, "plage de tableau", false, level or 3)
+  if r2 <= r1 then error("xlsx: un tableau doit contenir un en-tête et au moins une ligne de données", level or 3) end
+  opts = opts or {}; if type(opts) ~= "table" then error("xlsx: les options de tableau doivent être une table", level or 3) end
+  local allowed = { name=true, style=true, show_first_column=true, show_last_column=true, show_row_stripes=true, show_column_stripes=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option de tableau inconnue : " .. tostring(k), level or 3) end end
+  local name = validate_table_name(opts.name or ("Table" .. (#sheet.tables + 1)), level or 3)
+  local style = opts.style or "TableStyleMedium2"
+  local valid_style = type(style) == "string" and (style:match("^TableStyleLight%d+$") or style:match("^TableStyleMedium%d+$") or style:match("^TableStyleDark%d+$"))
+  if not valid_style then error("xlsx: style de tableau invalide", level or 3) end
+  local columns, seen = {}, {}
+  local header = sheet.cells[r1]
+  for col = c1, c2 do
+    local value = header and header[col]
+    if type(value) ~= "string" or value == "" then error("xlsx: chaque en-tête de tableau doit être une string non vide", level or 3) end
+    local key = value:lower(); if seen[key] then error("xlsx: en-tête de tableau dupliqué : " .. value, level or 3) end
+    seen[key] = true; columns[#columns + 1] = value
+  end
+  for _, key in ipairs({"show_first_column","show_last_column","show_row_stripes","show_column_stripes"}) do
+    if opts[key] ~= nil and type(opts[key]) ~= "boolean" then error("xlsx: " .. key .. " doit être un booléen", level or 3) end
+  end
+  return { ref=normalized, r1=r1,c1=c1,r2=r2,c2=c2,name=name,style=style,columns=columns,
+    show_first_column=opts.show_first_column == true, show_last_column=opts.show_last_column == true,
+    show_row_stripes=opts.show_row_stripes ~= false, show_column_stripes=opts.show_column_stripes == true }
+end
+
+--- Ajoute un tableau structuré Excel sur une plage possédant une ligne d'en-tête.
+function Sheet:add_table(ref, opts)
+  local item = normalize_table(self, ref, opts, 3)
+  for _, current in ipairs(self.tables) do if ranges_overlap(item, current) then error("xlsx: le tableau " .. item.ref .. " chevauche " .. current.ref, 2) end end
+  self.tables[#self.tables + 1] = item; return self
+end
+function Sheet:remove_table(name)
+  name = validate_table_name(name, 3)
+  for i, item in ipairs(self.tables) do if item.name:lower() == name:lower() then table.remove(self.tables, i); return self end end
+  return self
+end
+
+local PAPER_SIZES = { letter=1, legal=5, a4=9, a3=8, a5=11 }
+--- Configure orientation, papier, mise à l'échelle et centrage à l'impression.
+function Sheet:set_page_setup(opts)
+  if opts == false then self.page_setup = nil; self.print_options = nil; return self end
+  opts = opts or {}; if type(opts) ~= "table" then error("xlsx: set_page_setup attend une table", 2) end
+  local allowed = { orientation=true, paper_size=true, scale=true, fit_to_width=true, fit_to_height=true, horizontal_centered=true, vertical_centered=true, grid_lines=true, headings=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option de mise en page inconnue : " .. tostring(k), 2) end end
+  local orientation = opts.orientation or "portrait"
+  if orientation ~= "portrait" and orientation ~= "landscape" then error("xlsx: orientation doit valoir portrait ou landscape", 2) end
+  local paper = opts.paper_size or "a4"
+  local paper_id = type(paper) == "string" and PAPER_SIZES[paper:lower()] or paper
+  if math.type(paper_id) ~= "integer" or paper_id < 1 or paper_id > 118 then error("xlsx: paper_size invalide", 2) end
+  local scale = opts.scale
+  if scale ~= nil then check_finite_number(scale, "échelle d'impression", 10, 400, 3) end
+  local fitw, fith = opts.fit_to_width, opts.fit_to_height
+  if fitw ~= nil and (math.type(fitw) ~= "integer" or fitw < 0 or fitw > 32767) then error("xlsx: fit_to_width doit être un entier 0..32767", 2) end
+  if fith ~= nil and (math.type(fith) ~= "integer" or fith < 0 or fith > 32767) then error("xlsx: fit_to_height doit être un entier 0..32767", 2) end
+  if scale ~= nil and (fitw ~= nil or fith ~= nil) then error("xlsx: scale est incompatible avec fit_to_width/fit_to_height", 2) end
+  for _, key in ipairs({"horizontal_centered","vertical_centered","grid_lines","headings"}) do if opts[key] ~= nil and type(opts[key]) ~= "boolean" then error("xlsx: " .. key .. " doit être un booléen", 2) end end
+  self.page_setup = { orientation=orientation,paper_size=paper_id,scale=scale,fit_to_width=fitw,fit_to_height=fith }
+  self.print_options = { horizontal_centered=opts.horizontal_centered==true, vertical_centered=opts.vertical_centered==true,
+    grid_lines=opts.grid_lines==true, headings=opts.headings==true }
+  return self
+end
+
+function Sheet:set_page_margins(opts)
+  if opts == false then self.page_margins = nil; return self end
+  opts = opts or {}; if type(opts) ~= "table" then error("xlsx: set_page_margins attend une table", 2) end
+  local defaults = { left=0.7,right=0.7,top=0.75,bottom=0.75,header=0.3,footer=0.3 }
+  for k in pairs(opts) do if defaults[k] == nil then error("xlsx: marge inconnue : " .. tostring(k), 2) end end
+  local out = {}; for k,v in pairs(defaults) do out[k]=opts[k] == nil and v or opts[k]; check_finite_number(out[k], "marge "..k, 0, 100, 3) end
+  self.page_margins = out; return self
+end
+
+function Sheet:set_header_footer(opts)
+  if opts == false then self.header_footer = nil; return self end
+  opts = opts or {}; if type(opts) ~= "table" then error("xlsx: set_header_footer attend une table", 2) end
+  local allowed = { header_left=true,header_center=true,header_right=true,footer_left=true,footer_center=true,footer_right=true,different_first=true,different_odd_even=true }
+  for k in pairs(opts) do if not allowed[k] then error("xlsx: option d'en-tête/pied inconnue : " .. tostring(k), 2) end end
+  local out = {}
+  for _, key in ipairs({"header_left","header_center","header_right","footer_left","footer_center","footer_right"}) do out[key]=validate_optional_text(opts[key], key, 255, 3) end
+  for _, key in ipairs({"different_first","different_odd_even"}) do if opts[key] ~= nil and type(opts[key]) ~= "boolean" then error("xlsx: "..key.." doit être un booléen",2) end; out[key]=opts[key]==true end
+  self.header_footer=out; return self
+end
+
+function Sheet:set_print_area(ref)
+  if ref == false then self._print_area=nil; return self end
+  local _,_,_,_,normalized=parse_a1_range(ref,"zone d'impression",false,3); self._print_area=normalized; return self
+end
+local function normalize_repeat_rows(value, level)
+  if type(value) ~= "string" then error("xlsx: repeat_rows doit être une string comme 1:2", level or 3) end
+  local a,b=value:match("^(%d+):(%d+)$"); a,b=tonumber(a),tonumber(b)
+  if not a or a<1 or b<a or b>MAX_ROW+1 then error("xlsx: repeat_rows invalide", level or 3) end
+  return "$"..a..":$"..b
+end
+local function normalize_repeat_cols(value, level)
+  if type(value) ~= "string" then error("xlsx: repeat_columns doit être une string comme A:B", level or 3) end
+  local a,b=value:match("^%$?([A-Za-z]+):%$?([A-Za-z]+)$"); local c1,c2=col_number(a or ""),col_number(b or "")
+  if not c1 or not c2 or c1>c2 or c2>MAX_COL then error("xlsx: repeat_columns invalide", level or 3) end
+  return "$"..col_ref(c1)..":$"..col_ref(c2)
+end
+function Sheet:set_print_titles(opts)
+  if opts == false then self._repeat_rows=nil; self._repeat_cols=nil; return self end
+  opts=opts or {}; if type(opts)~="table" then error("xlsx: set_print_titles attend une table",2) end
+  for k in pairs(opts) do if k~="rows" and k~="columns" then error("xlsx: option de titres d'impression inconnue : "..tostring(k),2) end end
+  self._repeat_rows=opts.rows and normalize_repeat_rows(opts.rows,3) or nil
+  self._repeat_cols=opts.columns and normalize_repeat_cols(opts.columns,3) or nil
+  if not self._repeat_rows and not self._repeat_cols then error("xlsx: set_print_titles exige rows et/ou columns",2) end
+  return self
+end
+
 local DATA_VALIDATION_TYPES = {
   list="list", whole="whole", decimal="decimal", date="date", time="time",
   text_length="textLength", custom="custom",
@@ -1090,7 +1368,7 @@ local VALIDATION_OPERATORS = {
 local VALIDATION_OPERATOR_FROM_XML = {}
 for k, v in pairs(VALIDATION_OPERATORS) do VALIDATION_OPERATOR_FROM_XML[v] = k end
 
-local function validate_optional_text(value, what, max_bytes, level)
+validate_optional_text = function(value, what, max_bytes, level)
   if value == nil then return nil end
   if type(value) ~= "string" then error("xlsx: " .. what .. " doit être une string", level or 3) end
   validate_xml_text(value, what, level or 3)
@@ -1460,7 +1738,12 @@ function Sheet:_xml(sst, sst_index)
   local b = {}
   b[#b + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
   b[#b + 1] = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-  if self._tab_color then b[#b + 1] = '<sheetPr><tabColor rgb="' .. self._tab_color .. '"/></sheetPr>' end
+  if self._tab_color or (self.page_setup and (self.page_setup.fit_to_width ~= nil or self.page_setup.fit_to_height ~= nil)) then
+    b[#b + 1] = '<sheetPr>'
+    if self._tab_color then b[#b + 1] = '<tabColor rgb="' .. self._tab_color .. '"/>' end
+    if self.page_setup and (self.page_setup.fit_to_width ~= nil or self.page_setup.fit_to_height ~= nil) then b[#b + 1] = '<pageSetUpPr fitToPage="1"/>' end
+    b[#b + 1] = '</sheetPr>'
+  end
   if self.maxrow >= 0 and self.maxcol >= 0 then
     b[#b + 1] = '<dimension ref="A1:' .. col_ref(self.maxcol) .. (self.maxrow + 1) .. '"/>'
   end
@@ -1611,6 +1894,36 @@ function Sheet:_xml(sst, sst_index)
     end
   end
   if #links > 0 then b[#b + 1] = '<hyperlinks>' .. table.concat(links) .. '</hyperlinks>' end
+  if self.print_options then
+    local attrs = {}
+    if self.print_options.horizontal_centered then attrs[#attrs+1]='horizontalCentered="1"' end
+    if self.print_options.vertical_centered then attrs[#attrs+1]='verticalCentered="1"' end
+    if self.print_options.grid_lines then attrs[#attrs+1]='gridLines="1"' end
+    if self.print_options.headings then attrs[#attrs+1]='headings="1"' end
+    if #attrs > 0 then b[#b+1]='<printOptions '..table.concat(attrs,' ')..'/>' end
+  end
+  if self.page_margins then
+    local m=self.page_margins; b[#b+1]=string.format('<pageMargins left="%s" right="%s" top="%s" bottom="%s" header="%s" footer="%s"/>',num2str(m.left),num2str(m.right),num2str(m.top),num2str(m.bottom),num2str(m.header),num2str(m.footer))
+  end
+  if self.page_setup then
+    local p=self.page_setup; local attrs={'orientation="'..p.orientation..'"','paperSize="'..p.paper_size..'"'}
+    if p.scale then attrs[#attrs+1]='scale="'..num2str(p.scale)..'"' end
+    if p.fit_to_width ~= nil then attrs[#attrs+1]='fitToWidth="'..p.fit_to_width..'"' end
+    if p.fit_to_height ~= nil then attrs[#attrs+1]='fitToHeight="'..p.fit_to_height..'"' end
+    b[#b+1]='<pageSetup '..table.concat(attrs,' ')..'/>'
+  end
+  if self.header_footer then
+    local h=self.header_footer; local attrs={}
+    if h.different_first then attrs[#attrs+1]='differentFirst="1"' end
+    if h.different_odd_even then attrs[#attrs+1]='differentOddEven="1"' end
+    b[#b+1]='<headerFooter'..(#attrs>0 and (' '..table.concat(attrs,' ')) or '')..'>'
+    local header=(h.header_left and '&L'..h.header_left or '')..(h.header_center and '&C'..h.header_center or '')..(h.header_right and '&R'..h.header_right or '')
+    local footer=(h.footer_left and '&L'..h.footer_left or '')..(h.footer_center and '&C'..h.footer_center or '')..(h.footer_right and '&R'..h.footer_right or '')
+    if header~='' then b[#b+1]='<oddHeader>'..esc_xml(header,"en-tête",0)..'</oddHeader>' end
+    if footer~='' then b[#b+1]='<oddFooter>'..esc_xml(footer,"pied de page",0)..'</oddFooter>' end
+    b[#b+1]='</headerFooter>'
+  end
+
   local comments, vml = comments_xml(self)
   if comments then
     local comments_id = "rId" .. (#rels + 1)
@@ -1618,6 +1931,18 @@ function Sheet:_xml(sst, sst_index)
     local vml_id = "rId" .. (#rels + 1)
     rels[#rels + 1] = { id=vml_id, target="../drawings/commentsDrawing" .. self._sheet_index .. ".vml", kind="vmlDrawing" }
     b[#b + 1] = '<legacyDrawing r:id="' .. vml_id .. '"/>'
+  end
+  if #self.images + #self.charts > 0 then
+    local drawing_id="rId"..(#rels+1); rels[#rels+1]={id=drawing_id,target="../drawings/drawing"..self._sheet_index..".xml",kind="drawing"}
+    b[#b+1]='<drawing r:id="'..drawing_id..'"/>'
+  end
+  if #self.tables > 0 then
+    b[#b+1]='<tableParts count="'..#self.tables..'">'
+    for _, table_def in ipairs(self.tables) do
+      local id="rId"..(#rels+1); rels[#rels+1]={id=id,target="../tables/table"..table_def._table_id..".xml",kind="table"}
+      b[#b+1]='<tablePart r:id="'..id..'"/>'
+    end
+    b[#b+1]='</tableParts>'
   end
   b[#b + 1] = '</worksheet>'
   return table.concat(b), worksheet_relationships_xml(rels), comments, vml
@@ -1751,6 +2076,57 @@ function Workbook:get_defined_names()
   return out
 end
 
+
+local function table_xml(item)
+  local b={'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="'..item._table_id..'" name="'..esc_xml(item.name,"nom de tableau",0)..'" displayName="'..esc_xml(item.name,"nom de tableau",0)..'" ref="'..item.ref..'" totalsRowShown="0">',
+    '<autoFilter ref="'..item.ref..'"/>','<tableColumns count="'..#item.columns..'">'}
+  for i,name in ipairs(item.columns) do b[#b+1]='<tableColumn id="'..i..'" name="'..esc_xml(name,"colonne de tableau",0)..'"/>' end
+  b[#b+1]='</tableColumns><tableStyleInfo name="'..item.style..'" showFirstColumn="'..(item.show_first_column and '1' or '0')..'" showLastColumn="'..(item.show_last_column and '1' or '0')..'" showRowStripes="'..(item.show_row_stripes and '1' or '0')..'" showColumnStripes="'..(item.show_column_stripes and '1' or '0')..'"/></table>'
+  return table.concat(b)
+end
+
+local function chart_title_xml(title)
+  if not title then return '<c:autoTitleDeleted val="1"/>' end
+  return '<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="fr-FR"/><a:t>'..esc_xml(title,"titre de graphique",0)..'</a:t></a:r></a:p></c:rich></c:tx><c:layout/><c:overlay val="0"/></c:title>'
+end
+local function chart_xml(chart, chart_id)
+  local cat_axis=100000+chart_id*2; local val_axis=cat_axis+1
+  local b={'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>','<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart>',chart_title_xml(chart.title),'<c:plotArea><c:layout/>'}
+  if chart.type=='line' then b[#b+1]='<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>' else b[#b+1]='<c:barChart><c:barDir val="'..(chart.type=='bar' and 'bar' or 'col')..'"/><c:grouping val="clustered"/><c:varyColors val="0"/>' end
+  for i,series in ipairs(chart.series) do
+    b[#b+1]='<c:ser><c:idx val="'..(i-1)..'"/><c:order val="'..(i-1)..'"/>'
+    if series.name_ref then b[#b+1]='<c:tx><c:strRef><c:f>'..esc_xml(series.name_ref,"référence de série",0)..'</c:f></c:strRef></c:tx>'
+    elseif series.name then b[#b+1]='<c:tx><c:v>'..esc_xml(series.name,"nom de série",0)..'</c:v></c:tx>' end
+    if chart.type=='line' then b[#b+1]='<c:marker><c:symbol val="none"/></c:marker>' end
+    b[#b+1]='<c:cat><c:strRef><c:f>'..esc_xml(chart.categories,"catégories",0)..'</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>'..esc_xml(series.values,"valeurs",0)..'</c:f></c:numRef></c:val></c:ser>'
+  end
+  if chart.type=='line' then b[#b+1]='<c:smooth val="0"/><c:axId val="'..cat_axis..'"/><c:axId val="'..val_axis..'"/></c:lineChart>' else b[#b+1]='<c:gapWidth val="150"/><c:axId val="'..cat_axis..'"/><c:axId val="'..val_axis..'"/></c:barChart>' end
+  b[#b+1]='<c:catAx><c:axId val="'..cat_axis..'"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:numFmt formatCode="General" sourceLinked="1"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crossAx val="'..val_axis..'"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/></c:catAx>'
+  b[#b+1]='<c:valAx><c:axId val="'..val_axis..'"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines/><c:numFmt formatCode="General" sourceLinked="1"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crossAx val="'..cat_axis..'"/><c:crosses val="autoZero"/><c:crossBetween val="between"/></c:valAx></c:plotArea>'
+  if chart.legend then b[#b+1]='<c:legend><c:legendPos val="r"/><c:layout/><c:overlay val="0"/></c:legend>' end
+  b[#b+1]='<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/><c:showDLblsOverMax val="0"/></c:chart></c:chartSpace>'
+  return table.concat(b)
+end
+
+local function drawing_xml(sheet)
+  local b={'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>','<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'}
+  local rels={}; local object_id=1
+  for _,img in ipairs(sheet.images) do
+    local rid='rId'..(#rels+1); rels[#rels+1]={id=rid,kind='image',target='../media/image'..img._media_id..'.'..img.format}
+    local name=img.name or ('Image '..object_id); local descr=img.alt_text or ''
+    b[#b+1]='<xdr:oneCellAnchor><xdr:from><xdr:col>'..img.col..'</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>'..img.row..'</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="'..math.floor(img.width*9525+0.5)..'" cy="'..math.floor(img.height*9525+0.5)..'"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="'..object_id..'" name="'..esc_xml(name,"nom d'image",0)..'" descr="'..esc_xml(descr,"texte alternatif",0)..'"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="'..rid..'"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="'..math.floor(img.width*9525+0.5)..'" cy="'..math.floor(img.height*9525+0.5)..'"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>'
+    object_id=object_id+1
+  end
+  for _,chart in ipairs(sheet.charts) do
+    local rid='rId'..(#rels+1); rels[#rels+1]={id=rid,kind='chart',target='../charts/chart'..chart._chart_id..'.xml'}
+    b[#b+1]='<xdr:oneCellAnchor><xdr:from><xdr:col>'..chart.col..'</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>'..chart.row..'</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="'..math.floor(chart.width*9525+0.5)..'" cy="'..math.floor(chart.height*9525+0.5)..'"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="'..object_id..'" name="Graphique '..object_id..'"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="'..math.floor(chart.width*9525+0.5)..'" cy="'..math.floor(chart.height*9525+0.5)..'"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="'..rid..'"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor>'
+    object_id=object_id+1
+  end
+  b[#b+1]='</xdr:wsDr>'
+  return table.concat(b), worksheet_relationships_xml(rels)
+end
+
 -- construit la liste des parties ZIP {name=, data=}
 function Workbook:_parts()
   local nsheets = #self.sheets
@@ -1762,6 +2138,15 @@ function Workbook:_parts()
     error("xlsx: la feuille active doit être visible", 2)
   end
   self._style_registry = new_style_registry()
+  local table_names, next_table_id, next_media_id, next_chart_id = {}, 1, 1, 1
+  for _, sheet in ipairs(self.sheets) do
+    for _, item in ipairs(sheet.tables) do
+      local key=item.name:lower(); if table_names[key] then error("xlsx: nom de tableau dupliqué dans le classeur : "..item.name,2) end
+      table_names[key]=true; item._table_id=next_table_id; next_table_id=next_table_id+1
+    end
+    for _, item in ipairs(sheet.images) do item._media_id=next_media_id; next_media_id=next_media_id+1 end
+    for _, item in ipairs(sheet.charts) do item._chart_id=next_chart_id; next_chart_id=next_chart_id+1 end
+  end
   local sst, sst_index = {}, {}
   local sheet_xmls, sheet_rels, sheet_comments, sheet_vml = {}, {}, {}, {}
   for i = 1, nsheets do
@@ -1780,6 +2165,10 @@ function Workbook:_parts()
     local has_comments = false
     for i = 1, nsheets do if sheet_comments[i] then has_comments = true; break end end
     if has_comments then t[#t + 1] = '<Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/>' end
+    if next_media_id > 1 then
+      t[#t+1]='<Default Extension="png" ContentType="image/png"/>'
+      t[#t+1]='<Default Extension="jpeg" ContentType="image/jpeg"/>'
+    end
     t[#t + 1] = '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
     for i = 1, nsheets do
       t[#t + 1] = '<Override PartName="/xl/worksheets/sheet' .. i ..
@@ -1790,6 +2179,9 @@ function Workbook:_parts()
     for i = 1, nsheets do if sheet_comments[i] then
       t[#t + 1] = '<Override PartName="/xl/comments/comment' .. i .. '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>'
     end end
+    for i=1,nsheets do if #self.sheets[i].images + #self.sheets[i].charts > 0 then t[#t+1]='<Override PartName="/xl/drawings/drawing'..i..'.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>' end end
+    for _,sheet in ipairs(self.sheets) do for _,item in ipairs(sheet.charts) do t[#t+1]='<Override PartName="/xl/charts/chart'..item._chart_id..'.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>' end end
+    for _,sheet in ipairs(self.sheets) do for _,item in ipairs(sheet.tables) do t[#t+1]='<Override PartName="/xl/tables/table'..item._table_id..'.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>' end end
     t[#t + 1] = '</Types>'
     add("[Content_Types].xml", table.concat(t))
   end
@@ -1814,7 +2206,8 @@ function Workbook:_parts()
         '" sheetId="' .. i .. '"' .. state .. ' r:id="rId' .. i .. '"/>'
     end
     t[#t + 1] = '</sheets>'
-    if #self._defined_names > 0 then
+    local has_print_names=false; for _,sheet in ipairs(self.sheets) do if sheet._print_area or sheet._repeat_rows or sheet._repeat_cols then has_print_names=true; break end end
+    if #self._defined_names > 0 or has_print_names then
       t[#t + 1] = '<definedNames>'
       for _, item in ipairs(self._defined_names) do
         local attrs = { 'name="' .. esc_xml(item.name, "nom défini", 0) .. '"' }
@@ -1822,6 +2215,14 @@ function Workbook:_parts()
         if item.hidden then attrs[#attrs + 1] = 'hidden="1"' end
         if item.comment then attrs[#attrs + 1] = 'comment="' .. esc_xml(item.comment, "commentaire", 0) .. '"' end
         t[#t + 1] = '<definedName ' .. table.concat(attrs, " ") .. '>' .. esc_xml(item.reference, "référence", 0) .. '</definedName>'
+      end
+      for i,sheet in ipairs(self.sheets) do
+        local q=quote_sheet_name(sheet.name)
+        if sheet._print_area then t[#t+1]='<definedName name="_xlnm.Print_Area" localSheetId="'..(i-1)..'">'..esc_xml(q..'!'..absolute_a1_range(sheet._print_area,"zone d'impression",0),"zone d'impression",0)..'</definedName>' end
+        if sheet._repeat_rows or sheet._repeat_cols then
+          local refs={}; if sheet._repeat_rows then refs[#refs+1]=q..'!'..sheet._repeat_rows end; if sheet._repeat_cols then refs[#refs+1]=q..'!'..sheet._repeat_cols end
+          t[#t+1]='<definedName name="_xlnm.Print_Titles" localSheetId="'..(i-1)..'">'..esc_xml(table.concat(refs,','),"titres d'impression",0)..'</definedName>'
+        end
       end
       t[#t + 1] = '</definedNames>'
     end
@@ -1850,6 +2251,11 @@ function Workbook:_parts()
     if sheet_rels[i] then add("xl/worksheets/_rels/sheet" .. i .. ".xml.rels", sheet_rels[i]) end
     if sheet_comments[i] then add("xl/comments/comment" .. i .. ".xml", sheet_comments[i]) end
     if sheet_vml[i] then add("xl/drawings/commentsDrawing" .. i .. ".vml", sheet_vml[i]) end
+    local sheet=self.sheets[i]
+    if #sheet.images + #sheet.charts > 0 then local dx,dr=drawing_xml(sheet); add("xl/drawings/drawing"..i..".xml",dx); add("xl/drawings/_rels/drawing"..i..".xml.rels",dr) end
+    for _,img in ipairs(sheet.images) do add("xl/media/image"..img._media_id.."."..img.format,img.data) end
+    for _,chart in ipairs(sheet.charts) do add("xl/charts/chart"..chart._chart_id..".xml",chart_xml(chart,chart._chart_id)) end
+    for _,item in ipairs(sheet.tables) do add("xl/tables/table"..item._table_id..".xml",table_xml(item)) end
   end
 
   do
@@ -2758,10 +3164,37 @@ local function parse_sheet(xml, shared, datestyle, style_objects, dxf_objects, d
   table.sort(conditional_formats, function(a,b) return (a.priority or 0) < (b.priority or 0) end)
   local tab_color = xml:match('<tabColor[^>]-rgb="([%x]+)"')
   if tab_color then tab_color = normalize_color(tab_color, "couleur d'onglet", 0) end
+  local page_margins, page_setup, print_options, header_footer
+  local margin_attrs = xml:match("<pageMargins%s+(.-)/>")
+  if margin_attrs then
+    page_margins={}; for _,key in ipairs({"left","right","top","bottom","header","footer"}) do page_margins[key]=tonumber(xml_attr(margin_attrs,key)) end
+  end
+  local setup_attrs = xml:match("<pageSetup%s+(.-)/>")
+  if setup_attrs then page_setup={ orientation=xml_attr(setup_attrs,"orientation"), paper_size=tonumber(xml_attr(setup_attrs,"paperSize")), scale=tonumber(xml_attr(setup_attrs,"scale")), fit_to_width=tonumber(xml_attr(setup_attrs,"fitToWidth")), fit_to_height=tonumber(xml_attr(setup_attrs,"fitToHeight")) } end
+  local option_attrs = xml:match("<printOptions%s+(.-)/>")
+  if option_attrs then print_options={ horizontal_centered=xml_attr(option_attrs,"horizontalCentered")=="1" or xml_attr(option_attrs,"horizontalCentered")=="true", vertical_centered=xml_attr(option_attrs,"verticalCentered")=="1" or xml_attr(option_attrs,"verticalCentered")=="true", grid_lines=xml_attr(option_attrs,"gridLines")=="1" or xml_attr(option_attrs,"gridLines")=="true", headings=xml_attr(option_attrs,"headings")=="1" or xml_attr(option_attrs,"headings")=="true" } end
+  local hf_attrs, hf_body = xml:match("<headerFooter%s*(.-)>(.-)</headerFooter>")
+  if hf_body then
+    local function split_hf(text)
+      text=unescape(text or ""); local out={}; local current,buf
+      local i=1
+      while i<=#text do
+        local code=text:sub(i,i+1)
+        if code=="&L" or code=="&C" or code=="&R" then if current then out[current]=table.concat(buf) end; current=code:sub(2); buf={}; i=i+2
+        else if current then buf[#buf+1]=text:sub(i,i) end; i=i+1 end
+      end
+      if current then out[current]=table.concat(buf) end; return out
+    end
+    local h=split_hf(hf_body:match("<oddHeader>(.-)</oddHeader>")); local f=split_hf(hf_body:match("<oddFooter>(.-)</oddFooter>"))
+    header_footer={ header_left=h.L,header_center=h.C,header_right=h.R,footer_left=f.L,footer_center=f.C,footer_right=f.R,
+      different_first=xml_attr(hf_attrs,"differentFirst")=="1" or xml_attr(hf_attrs,"differentFirst")=="true",
+      different_odd_even=xml_attr(hf_attrs,"differentOddEven")=="1" or xml_attr(hf_attrs,"differentOddEven")=="true" }
+  end
   local comment_map, comment_list = parse_comments(comment_xml)
   return cells, formulas, styles, maxrow, maxcol, row_heights, column_widths,
     freeze_rows, freeze_cols, auto_filter, merged, hyperlink_ranges,
-    row_hidden, column_hidden, data_validations, conditional_formats, tab_color, comment_map, comment_list
+    row_hidden, column_hidden, data_validations, conditional_formats, tab_color, comment_map, comment_list,
+    page_margins, page_setup, print_options, header_footer
 end
 
 local function package_path(base, target)
@@ -2779,6 +3212,53 @@ local function package_path(base, target)
     end
   end
   return table.concat(out, "/")
+end
+
+
+local function parse_table_part(xml)
+  local tag=xml:match("<table%s+(.-)>") or xml:match("<table%s+(.-)/>") or ""
+  local style_attrs=xml:match("<tableStyleInfo%s+(.-)/>") or ""
+  local columns={}; for attrs in xml:gmatch("<tableColumn%s+(.-)/>") do columns[#columns+1]=xml_attr(attrs,"name") end
+  return { name=xml_attr(tag,"displayName") or xml_attr(tag,"name"), ref=xml_attr(tag,"ref"), style=xml_attr(style_attrs,"name"),
+    show_first_column=xml_attr(style_attrs,"showFirstColumn")=="1", show_last_column=xml_attr(style_attrs,"showLastColumn")=="1",
+    show_row_stripes=xml_attr(style_attrs,"showRowStripes")=="1", show_column_stripes=xml_attr(style_attrs,"showColumnStripes")=="1", columns=columns }
+end
+
+local function parse_chart_part(xml)
+  local plain=xml:gsub("c:",""):gsub("a:","")
+  local kind="line"; if plain:find("<barChart",1,true) then kind=(plain:match('<barDir%s+val="([^"]+)"')=="bar") and "bar" or "column" end
+  local title=plain:match("<title>.-<t>(.-)</t>.-</title>"); if title then title=unescape(title) end
+  local series={}; local categories
+  for body in plain:gmatch("<ser>(.-)</ser>") do
+    local name=body:match("<tx>.-<v>(.-)</v>.-</tx>"); local name_ref=body:match("<tx>.-<strRef>.-<f>(.-)</f>")
+    local cat=body:match("<cat>.-<f>(.-)</f>"); local values=body:match("<val>.-<f>(.-)</f>")
+    if not categories and cat then categories=unescape(cat) end
+    series[#series+1]={ name=name and unescape(name) or nil, name_ref=name_ref and unescape(name_ref) or nil, values=values and unescape(values) or nil }
+  end
+  return { type=kind,title=title,categories=categories,series=series,legend=plain:find("<legend",1,true)~=nil }
+end
+
+local function parse_drawing_part(xml, relxml, drawing_path, byname, data, limits)
+  local relationships=parse_relationships(relxml); local plain=xml:gsub("xdr:",""):gsub("a:",""):gsub("c:","")
+  local images,charts={},{}; local base=drawing_path:match("^(.*[/])") or ""
+  for anchor in plain:gmatch("<oneCellAnchor>(.-)</oneCellAnchor>") do
+    local col=tonumber(anchor:match("<from>.-<col>(%d+)</col>")) or 0; local row=tonumber(anchor:match("<from>.-<row>(%d+)</row>")) or 0
+    local cx,cy=anchor:match('<ext%s+cx="(%d+)"%s+cy="(%d+)"'); local width,height=(tonumber(cx) or 0)/9525,(tonumber(cy) or 0)/9525
+    if anchor:find("<pic>",1,true) then
+      local rid=anchor:match('blip[^>]-r:embed="([^"]+)"'); local rel=rid and relationships[rid]
+      if rel then local path=package_path(base,rel.target); local entry=path and byname[path]; local binary=entry and zip_extract(data,entry,limits) or nil
+        local format=path and path:match("%.([^.]+)$") or nil; if format=="jpg" then format="jpeg" end
+        local nattrs=anchor:match("<cNvPr%s+(.-)/>") or ""
+        images[#images+1]={row=row,col=col,width=width,height=height,format=format,name=xml_attr(nattrs,"name"),alt_text=xml_attr(nattrs,"descr"),data=binary,path=path}
+      end
+    elseif anchor:find("<graphicFrame",1,true) then
+      local rid=anchor:match('chart[^>]-r:id="([^"]+)"'); local rel=rid and relationships[rid]
+      if rel then local path=package_path(base,rel.target); local entry=path and byname[path]
+        if entry then local chart=parse_chart_part(validate_xml_document(zip_extract(data,entry,limits),path)); chart.row,chart.col,chart.width,chart.height,chart.path=row,col,width,height,path; charts[#charts+1]=chart end
+      end
+    end
+  end
+  return images,charts
 end
 
 local function parse_workbook(wbxml, relsxml)
@@ -2817,10 +3297,13 @@ local function parse_workbook(wbxml, relsxml)
   local defined_names = {}
   local body = wbxml:match("<definedNames>(.-)</definedNames>") or ""
   for attrs, reference in body:gmatch("<definedName%s+(.-)>(.-)</definedName>") do
-    local name = xml_attr(attrs, "name")
-    if name then defined_names[#defined_names + 1] = {
-      name=unescape(name), reference=unescape(reference),
-      local_sheet=(tonumber(xml_attr(attrs, "localSheetId")) and tonumber(xml_attr(attrs, "localSheetId")) + 1 or nil),
+    local name = xml_attr(attrs, "name"); local local_sheet=(tonumber(xml_attr(attrs,"localSheetId")) and tonumber(xml_attr(attrs,"localSheetId"))+1 or nil); reference=unescape(reference)
+    if name == "_xlnm.Print_Area" and local_sheet and sheets[local_sheet] then
+      local ref=reference:match("!(.+)$"); if ref then sheets[local_sheet].print_area=ref:gsub("%$","") end
+    elseif name == "_xlnm.Print_Titles" and local_sheet and sheets[local_sheet] then
+      for part in reference:gmatch("[^,]+") do local ref=part:match("!(.+)$"); if ref then if ref:match("^%$%d+:%$%d+$") then sheets[local_sheet].repeat_rows=ref:gsub("%$","") elseif ref:match("^%$[A-Z]+:%$[A-Z]+$") then sheets[local_sheet].repeat_cols=ref:gsub("%$","") end end end
+    elseif name then defined_names[#defined_names + 1] = {
+      name=unescape(name), reference=reference, local_sheet=local_sheet,
       hidden=xml_attr(attrs, "hidden") == "1" or xml_attr(attrs, "hidden") == "true",
       comment=(xml_attr(attrs, "comment") and unescape(xml_attr(attrs, "comment"))),
     } end
@@ -2928,6 +3411,25 @@ function ReadSheet:hyperlinks()
   return out
 end
 
+
+function ReadSheet:get_images()
+  local out={}; for i,v in ipairs(self.image_list) do out[i]=shallow_copy(v) end; return out
+end
+function ReadSheet:get_charts()
+  local out={}; for i,v in ipairs(self.chart_list) do local c=shallow_copy(v); c.series={}; for j,ser in ipairs(v.series or {}) do c.series[j]=shallow_copy(ser) end; out[i]=c end; return out
+end
+function ReadSheet:get_tables()
+  local out={}; for i,v in ipairs(self.table_list) do local t=shallow_copy(v); t.columns={table.unpack(v.columns or {})}; out[i]=t end; return out
+end
+function ReadSheet:get_page_margins() return self.page_margins and shallow_copy(self.page_margins) or nil end
+function ReadSheet:get_page_setup()
+  if not self.page_setup and not self.print_options then return nil end
+  local out=shallow_copy(self.page_setup or {}); for k,v in pairs(self.print_options or {}) do out[k]=v end; return out
+end
+function ReadSheet:get_header_footer() return self.header_footer and shallow_copy(self.header_footer) or nil end
+function ReadSheet:get_print_area() return self.print_area end
+function ReadSheet:get_print_titles() return self.repeat_rows, self.repeat_cols end
+
 --- Renvoie maxrow, maxcol (0-indexés ; -1, -1 si la feuille est vide).
 function ReadSheet:dims()
   return self.maxrow, self.maxcol
@@ -3009,15 +3511,23 @@ function ReadWB:sheet(which)
     local rel_entry = self._byname[rels_path_for_part(def.path)]
     local rel_xml = rel_entry and validate_xml_document(zip_extract(self._data, rel_entry, self._limits), rel_entry.name) or nil
     local relationships = parse_relationships(rel_xml)
-    local comment_xml
+    local comment_xml; local image_list,chart_list,table_list={},{},{}
     for _, rel in pairs(relationships) do
       if rel.rel_type and rel.rel_type:match("/comments$") then
         local path = package_path("xl/worksheets/", rel.target)
         local ce = path and self._byname[path]
         if ce then comment_xml = validate_xml_document(zip_extract(self._data, ce, self._limits), path) end
+      elseif rel.rel_type and rel.rel_type:match("/drawing$") then
+        local path=package_path("xl/worksheets/",rel.target); local de=path and self._byname[path]
+        if de then local drawing_xml=validate_xml_document(zip_extract(self._data,de,self._limits),path); local rp=rels_path_for_part(path); local re=self._byname[rp]; local rxml=re and validate_xml_document(zip_extract(self._data,re,self._limits),rp) or nil; image_list,chart_list=parse_drawing_part(drawing_xml,rxml,path,self._byname,self._data,self._limits) end
+      elseif rel.rel_type and rel.rel_type:match("/table$") then
+        local path=package_path("xl/worksheets/",rel.target); local te=path and self._byname[path]
+        if te then local t=parse_table_part(validate_xml_document(zip_extract(self._data,te,self._limits),path)); t.path=path; table_list[#table_list+1]=t end
       end
     end
-    return { parse_sheet(xml, self._shared, self._datestyle, self._style_objects, self._dxf_objects, self._date1904, relationships, comment_xml) }
+    local values={ parse_sheet(xml, self._shared, self._datestyle, self._style_objects, self._dxf_objects, self._date1904, relationships, comment_xml) }
+    values[24],values[25],values[26]=image_list,chart_list,table_list
+    return values
   end)
   if not ok then return nil, tostring(result) end
   local values = result
@@ -3028,6 +3538,9 @@ function ReadWB:sheet(which)
     merged_ranges=values[11], hyperlink_ranges=values[12],
     row_hidden=values[13], column_hidden=values[14], data_validations=values[15],
     conditional_formats=values[16], tab_color=values[17], comment_map=values[18], comment_list=values[19],
+    page_margins=values[20], page_setup=values[21], print_options=values[22], header_footer=values[23],
+    image_list=values[24], chart_list=values[25], table_list=values[26],
+    print_area=def.print_area, repeat_rows=def.repeat_rows, repeat_cols=def.repeat_cols,
     visibility=def.visibility or "visible",
   }, ReadSheet)
   self._cache[def] = rs

@@ -4,7 +4,7 @@ Reference for the `xlsx` and `dataframe` modules. Babet with Lua 5.5 is the
 primary target, while the pure-Lua core remains compatible with standard Lua
 5.3+.
 
-Documentation for lua-xlsx 1.3.0.
+Documentation for lua-xlsx 1.4.0.
 
 ## Contents
 
@@ -12,6 +12,7 @@ Documentation for lua-xlsx 1.3.0.
 - [Conventions](#conventions)
 - [Writing XLSX files](#writing-xlsx-files)
 - [Styles, structure, layout, hyperlinks and formulas](#styles-structure-layout-hyperlinks-and-formulas)
+- [Reports, charts, images, and printing](#reports-charts-images-and-printing)
 - [1900 and 1904 dates](#1900-and-1904-dates)
 - [Reading XLSX files](#reading-xlsx-files)
 - [ZIP validation and limits](#zip-validation-and-limits)
@@ -138,14 +139,14 @@ sh:write_rows({
 
 ## Styles, structure, layout, hyperlinks and formulas
 
-Version 1.3.0 writes these elements and also exposes the supported subset
+Version 1.4.0 writes these elements and also exposes the supported subset
 through the reading API. `style`, `formula`, and `hyperlink` objects are
 immutable.
 
 ### `xlsx.VERSION`
 
 ```lua
-assert(xlsx.VERSION == "1.3.0")
+assert(xlsx.VERSION == "1.4.0")
 ```
 
 ### `xlsx.style([opts]) -> style`
@@ -523,7 +524,7 @@ end
 workbook:remove_defined_name("VATRate")
 ```
 
-### Complete 1.3.0 example
+### Complete 1.3.0 example (features retained)
 
 ```lua
 local xlsx = require("xlsx")
@@ -647,6 +648,286 @@ assert(xlsx.write_rows("result.xlsx", {
 ```
 
 ---
+
+
+## Reports, charts, images, and printing
+
+Version 1.4.0 adds the components needed for simple reports and dashboards.
+One worksheet drawing can contain several images and charts; structured tables
+and printing settings remain independent.
+
+### PNG and JPEG images
+
+#### `sheet:add_image(path, row, col [, opts])`
+
+```lua
+sh:add_image("logo.png", 0, 5)
+```
+
+Options:
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `width` | native | width in pixels, 1 to 10000 |
+| `height` | native | height in pixels, 1 to 10000 |
+| `alt_text` | none | accessible description, up to 1000 bytes |
+| `name` | generated | image object name, up to 255 bytes |
+
+Providing only one dimension preserves the aspect ratio:
+
+```lua
+sh:add_image("logo.png", 1, 5, { width = 160 })
+sh:add_image("photo.jpg", 8, 0, { height = 120 })
+```
+
+```lua
+sh:add_image("logo.png", 0, 5, {
+  width = 160,
+  alt_text = "lua-xlsx project logo",
+  name = "Main logo",
+})
+```
+
+Only PNG and JPEG are supported. The format is detected from the actual bytes.
+
+#### `sheet:add_image_data(data, format, row, col [, opts])`
+
+```lua
+local file = assert(io.open("logo.png", "rb"))
+local bytes = assert(file:read("a"))
+assert(file:close())
+sh:add_image_data(bytes, "png", 0, 5, { width = 160 })
+```
+
+`format` accepts `png`, `jpeg`, or `jpg`.
+
+#### `sheet:remove_image(index)`
+
+```lua
+sh:remove_image(1)
+```
+
+### Simple charts
+
+#### `sheet:add_chart(opts)`
+
+Supported types are `line`, `column`, and `bar`.
+
+```lua
+sh:add_chart({
+  type = "line",
+  title = "Monthly sales",
+  categories = "A2:A13",
+  series = {
+    { name_ref = "B1", values = "B2:B13" },
+  },
+  row = 1,
+  col = 5,
+})
+```
+
+Multiple series and explicit dimensions:
+
+```lua
+sh:add_chart({
+  type = "column",
+  categories = "A2:A13",
+  series = {
+    { name = "Actual", values = "B2:B13" },
+    { name = "Target", values = "C2:C13" },
+  },
+  row = 15,
+  col = 0,
+  width = 700,
+  height = 360,
+  legend = true,
+})
+```
+
+| Option | Default |
+|---|---:|
+| `type` | `column` |
+| `title` | none |
+| `categories` | required |
+| `series` | required, 1 to 255 |
+| `row`, `col` | `0`, `0` |
+| `width`, `height` | `640`, `360` |
+| `legend` | `true` |
+
+lua-xlsx stores range formulas but does not calculate or cache chart points.
+
+#### `sheet:remove_chart(index)`
+
+```lua
+sh:remove_chart(1)
+```
+
+### Structured Excel tables
+
+#### `sheet:add_table(ref [, opts])`
+
+The range must include a header row and at least one data row. Headers must be
+non-empty unique strings.
+
+```lua
+sh:add_table("A1:D100", { name = "SalesTable" })
+```
+
+```lua
+sh:add_table("A1:D100", {
+  name = "SalesTable",
+  style = "TableStyleMedium4",
+  show_row_stripes = true,
+  show_column_stripes = false,
+})
+```
+
+Options: `name`, `style`, `show_first_column`, `show_last_column`,
+`show_row_stripes`, and `show_column_stripes`. Table names are workbook-wide
+unique and tables on one sheet may not overlap.
+
+#### `sheet:remove_table(name)`
+
+```lua
+sh:remove_table("SalesTable")
+```
+
+### Page setup
+
+#### `sheet:set_page_setup(opts)`
+
+```lua
+sh:set_page_setup({ orientation = "landscape", paper_size = "a4" })
+```
+
+Fit to one page wide with unlimited height:
+
+```lua
+sh:set_page_setup({
+  orientation = "landscape",
+  paper_size = "a4",
+  fit_to_width = 1,
+  fit_to_height = 0,
+})
+```
+
+Fixed scale:
+
+```lua
+sh:set_page_setup({ scale = 85 })
+```
+
+`scale` accepts 10 to 400 and cannot be combined with fit settings. The method
+also accepts `horizontal_centered`, `vertical_centered`, `grid_lines`, and
+`headings`. Paper can be `letter`, `legal`, `a3`, `a4`, `a5`, or an integer
+OOXML paper identifier. Passing `false` clears the setup.
+
+### Page margins
+
+#### `sheet:set_page_margins(opts)`
+
+Values are inches:
+
+```lua
+sh:set_page_margins({
+  left = 0.4, right = 0.4,
+  top = 0.5, bottom = 0.5,
+  header = 0.3, footer = 0.3,
+})
+```
+
+Missing fields use conventional Excel defaults. Passing `false` clears the
+explicit margins.
+
+### Headers and footers
+
+#### `sheet:set_header_footer(opts)`
+
+```lua
+sh:set_header_footer({
+  header_left = "lua-xlsx",
+  header_center = "Annual report",
+  header_right = "&D",
+  footer_left = "Confidential",
+  footer_center = "&F",
+  footer_right = "Page &P / &N",
+})
+```
+
+Excel codes such as `&P`, `&N`, `&D`, and `&F` are preserved.
+`different_first` and `different_odd_even` are supported. Passing `false`
+clears the configuration.
+
+### Print area and repeated titles
+
+#### `sheet:set_print_area(ref)`
+
+```lua
+sh:set_print_area("A1:J60")
+```
+
+#### `sheet:set_print_titles(opts)`
+
+```lua
+sh:set_print_titles({ rows = "1:1" })
+sh:set_print_titles({ rows = "1:2", columns = "A:A" })
+```
+
+Rows use `1:2`; columns use `A:B`. Passing `false` removes the corresponding
+workbook-defined names.
+
+### Reading 1.4 metadata
+
+```lua
+local images = sh:get_images()
+local charts = sh:get_charts()
+local tables = sh:get_tables()
+local margins = sh:get_page_margins()
+local page = sh:get_page_setup()
+local header_footer = sh:get_header_footer()
+local print_area = sh:get_print_area()
+local repeat_rows, repeat_cols = sh:get_print_titles()
+```
+
+Image metadata includes binary bytes, format, anchor, size, name, and
+alternative text. Chart metadata includes type, title, category/series range
+formulas, and anchor. Table metadata includes name, range, style, and headers.
+
+### Complete 1.4.0 report example
+
+```lua
+local xlsx = require("xlsx")
+local wb = xlsx.new()
+local sh = wb:add_sheet("Dashboard")
+sh:write_rows({
+  { "Month", "Actual", "Target" },
+  { "January", 120, 100 },
+  { "February", 135, 130 },
+  { "March", 128, 140 },
+})
+sh:add_table("A1:C4", { name = "SalesTable", style = "TableStyleMedium4" })
+sh:add_image("logo.png", 0, 5, { width = 140, alt_text = "Company logo" })
+sh:add_chart({
+  type = "column",
+  title = "Actual versus target",
+  categories = "A2:A4",
+  series = {
+    { name_ref = "B1", values = "B2:B4" },
+    { name_ref = "C1", values = "C2:C4" },
+  },
+  row = 6, col = 0, width = 720, height = 380,
+})
+sh:set_page_setup({
+  orientation = "landscape", paper_size = "a4",
+  fit_to_width = 1, fit_to_height = 0,
+  horizontal_centered = true,
+})
+sh:set_page_margins({ left = 0.4, right = 0.4, top = 0.5, bottom = 0.5 })
+sh:set_header_footer({ header_center = "Sales dashboard", footer_right = "Page &P / &N" })
+sh:set_print_area("A1:J30")
+sh:set_print_titles({ rows = "1:1", columns = "A:A" })
+assert(wb:save("dashboard.xlsx"))
+```
 
 ## 1900 and 1904 dates
 
@@ -1003,7 +1284,7 @@ semantics, collision-free grouping and real openpyxl interoperability.
 
 Babet is resolved in this order: `BABET_BIN`, the local `bin/babet` file, then
 `babet` from `PATH`. The harness creates a temporary Python virtual environment,
-installs `openpyxl>=3.1,<4`, runs the interoperability round trip separately with
+installs `openpyxl>=3.1,<4` and `Pillow>=10,<12`, runs the interoperability round trip separately with
 Babet and standard Lua when both are available, and removes the venv, pip cache
 and temporary files at exit, including after a failure. A global openpyxl
 installation is neither used nor required.
@@ -1019,7 +1300,7 @@ chmod +x bin/babet
 
 BABET_BIN=../babet/bin/babet ./run_tests.sh
 LUA_BIN=/usr/bin/lua5.5 ./run_tests.sh
-OPENPYXL_SPEC='openpyxl==3.1.5' ./run_tests.sh
+OPENPYXL_SPEC='openpyxl==3.1.5' PILLOW_SPEC='pillow==11.3.0' ./run_tests.sh
 ```
 
 ---
@@ -1045,7 +1326,7 @@ temporary directory.
 
 - Writing uses STORED ZIP entries; reading supports STORED and DEFLATE.
 - The internal Lua parser does not support ZIP64.
-- No charts, images, structured tables, pivot tables, or XLSM macros.
+- No pivot tables, XLSM macros, combined charts, pie charts, SVG images, or advanced multi-area page layouts.
 - Conditional formatting is limited to the documented simple rules; data bars,
   icon sets, and color scales are not supported.
 - Comments are read and written as plain text; rich-text runs, custom dimensions,

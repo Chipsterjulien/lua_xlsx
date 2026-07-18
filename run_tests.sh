@@ -6,6 +6,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM HUP
 
 OPENPYXL_SPEC="${OPENPYXL_SPEC:-openpyxl>=3.1,<4}"
+PILLOW_SPEC="${PILLOW_SPEC:-pillow>=10,<12}"
 
 resolve_executable() {
   local candidate="$1"
@@ -84,12 +85,12 @@ create_python_venv() {
     return 1
   fi
 
-  echo "Installation temporaire de $OPENPYXL_SPEC"
+  echo "Installation temporaire de $OPENPYXL_SPEC et $PILLOW_SPEC"
   mkdir -p "$TMP/pip-cache" "$TMP/pip-tmp"
   PIP_DISABLE_PIP_VERSION_CHECK=1 \
   PIP_CACHE_DIR="$TMP/pip-cache" \
   TMPDIR="$TMP/pip-tmp" \
-    "$python" -m pip install --no-input --no-cache-dir "$OPENPYXL_SPEC"
+    "$python" -m pip install --no-input --no-cache-dir "$OPENPYXL_SPEC" "$PILLOW_SPEC"
 
   "$python" -c 'import openpyxl; print("openpyxl : " + openpyxl.__version__)'
   PYTHON_CMD="$python"

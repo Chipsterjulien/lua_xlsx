@@ -43,6 +43,15 @@ assert(input_cf[1].style.fill_color == "FFFFC7CE" or input_cf[1].style.fill_colo
 assert(assert(wb:sheet("Masquée")):get_visibility() == "hidden")
 assert(assert(wb:sheet("Très masquée")):get_visibility() == "very_hidden")
 assert(wb:get_defined_name("ZoneNoms") and wb:get_defined_name("ValeurLocale", 1))
+assert(#sh:get_images() == 1 and sh:get_images()[1].format == "png")
+assert(#sh:get_charts() == 1 and sh:get_charts()[1].type == "line")
+assert(#sh:get_tables() == 1 and sh:get_tables()[1].name == "InputTable")
+local input_setup = assert(sh:get_page_setup())
+assert(input_setup.orientation == "landscape" and input_setup.fit_to_width == 1)
+assert(sh:get_page_margins().left == 0.4)
+assert(sh:get_header_footer().header_center == "OpenPyXL")
+local input_repeat_rows, input_repeat_cols = sh:get_print_titles()
+assert(sh:get_print_area() == "A1:D10" and input_repeat_rows == "1:1" and input_repeat_cols == "A:A")
 
 local out = xlsx.new({ date_system = "1904" })
 local report = out:add_sheet("Résumé")
@@ -68,7 +77,7 @@ local header = xlsx.style({
 local money = xlsx.style({ number_format = "currency_eur" })
 local date_bold = xlsx.style({ bold = true })
 
-report:write(0, 0, "Rapport 1.3", header)
+report:write(0, 0, "Rapport 1.4", header)
 report:merge_cells("A1:D1")
 report:append_row({ "Nom", "Valeur", "Date", "Lien" }, header)
 report:append_row({ "Élise & <test>", 12.5, xlsx.datetime(2024, 3, 15, 13, 45, 30) })
@@ -102,6 +111,16 @@ report:add_conditional_format("B3:B20", {
   type = "cell", operator = "less_than", value = 0,
   style = xlsx.style({ font_color = "9C0006", fill_color = "FFC7CE" }),
 })
+
+local png = ("89504e470d0a1a0a0000000d49484452000000040000000308020000003b9639910000001049444154789c63fccf80004c0cb8380026760105e4f3b8d50000000049454e44ae426082"):gsub("%x%x", function(pair) return string.char(tonumber(pair,16)) end)
+report:add_image_data(png, "png", 6, 0, { width = 96, alt_text = "Logo lua-xlsx", name = "Logo" })
+report:add_table("A2:D4", { name = "ResumeTable", style = "TableStyleMedium2" })
+report:add_chart({ type = "line", title = "Valeurs", categories = "A3:A4", series = { { name_ref = "B2", values = "B3:B4" } }, row = 1, col = 5 })
+report:set_page_setup({ orientation = "landscape", paper_size = "a4", fit_to_width = 1, fit_to_height = 0, horizontal_centered = true })
+report:set_page_margins({ left = 0.4, right = 0.4, top = 0.5, bottom = 0.5 })
+report:set_header_footer({ header_center = "lua-xlsx 1.4", footer_right = "Page &P / &N" })
+report:set_print_area("A1:J30")
+report:set_print_titles({ rows = "1:2", columns = "A:A" })
 out:add_sheet("Cible"):write(0, 0, "destination")
 out:add_sheet("Masquée"):set_visibility("hidden")
 out:add_sheet("Très masquée"):set_visibility("very_hidden")

@@ -243,7 +243,7 @@ end
 -- ---- PRÉSENTATION ET FORMULES ----------------------------------------------
 print("\n[7] styles, dimensions, volets, filtres et formules")
 do
-  check(xlsx.VERSION == "1.3.0", "version du module 1.3.0")
+  check(xlsx.VERSION == "1.4.0", "version du module 1.4.0")
   local header = xlsx.style({
     bold = true,
     fill_color = "D9EAF7",
@@ -517,6 +517,78 @@ do
     local ok, err = bad:save(TMP2, { use_babet = false })
     check(ok == nil and type(err) == "string", "classeur sans feuille visible refusé")
   end
+end
+
+
+
+-- ---- IMAGES, GRAPHIQUES, TABLEAUX ET IMPRESSION 1.4 ------------------------
+print("\n[10] images, graphiques, tableaux et mise en page d'impression")
+do
+  local function from_hex(hex)
+    return (hex:gsub("%x%x", function(pair) return string.char(tonumber(pair, 16)) end))
+  end
+  local png = from_hex("89504e470d0a1a0a0000000d49484452000000040000000308020000003b9639910000001049444154789c63fccf80004c0cb8380026760105e4f3b8d50000000049454e44ae426082")
+  local wb = xlsx.new()
+  local sh = wb:add_sheet("Rapport")
+  sh:write_rows({
+    { "Mois", "Ventes", "Objectif" },
+    { "Janvier", 12, 10 },
+    { "Février", 18, 15 },
+    { "Mars", 16, 17 },
+  })
+  sh:add_table("A1:C4", { name = "VentesTable", style = "TableStyleMedium4", show_row_stripes = true })
+  sh:add_image_data(png, "png", 5, 0, { width = 80, alt_text = "Carré rouge", name = "Logo" })
+  sh:add_chart({
+    type = "column", title = "Ventes mensuelles", categories = "A2:A4",
+    series = {
+      { name_ref = "B1", values = "B2:B4" },
+      { name = "Objectif", values = "C2:C4" },
+    },
+    row = 0, col = 4, width = 520, height = 300,
+  })
+  sh:set_page_setup({ orientation = "landscape", paper_size = "a4", fit_to_width = 1, fit_to_height = 0, horizontal_centered = true, grid_lines = true })
+  sh:set_page_margins({ left = 0.4, right = 0.4, top = 0.5, bottom = 0.5 })
+  sh:set_header_footer({ header_left = "lua-xlsx", header_center = "Rapport", footer_right = "Page &P / &N" })
+  sh:set_print_area("A1:H20")
+  sh:set_print_titles({ rows = "1:1", columns = "A:A" })
+  assert(wb:save(TMP2, { use_babet = false }))
+
+  local read = assert(xlsx.open(TMP2, { use_babet = false }))
+  local rs = assert(read:sheet("Rapport"))
+  local images = rs:get_images()
+  check(#images == 1 and images[1].format == "png" and images[1].row == 5 and images[1].col == 0
+      and images[1].alt_text == "Carré rouge" and #images[1].data == #png, "image PNG relue")
+  local charts = rs:get_charts()
+  check(#charts == 1 and charts[1].type == "column" and charts[1].title == "Ventes mensuelles"
+      and #charts[1].series == 2 and charts[1].series[1].name_ref:match("B%$1"), "graphique et séries relus")
+  local tables = rs:get_tables()
+  check(#tables == 1 and tables[1].name == "VentesTable" and tables[1].ref == "A1:C4"
+      and tables[1].columns[2] == "Ventes" and tables[1].show_row_stripes == true, "tableau structuré relu")
+  local setup = rs:get_page_setup()
+  check(setup and setup.orientation == "landscape" and setup.paper_size == 9
+      and setup.fit_to_width == 1 and setup.fit_to_height == 0 and setup.horizontal_centered == true,
+    "mise en page relue")
+  local margins = rs:get_page_margins()
+  check(margins and margins.left == 0.4 and margins.top == 0.5, "marges relues")
+  local hf = rs:get_header_footer()
+  check(hf and hf.header_left == "lua-xlsx" and hf.header_center == "Rapport"
+      and hf.footer_right == "Page &P / &N", "en-tête et pied de page relus")
+  local rows, cols = rs:get_print_titles()
+  check(rs:get_print_area() == "A1:H20" and rows == "1:1" and cols == "A:A",
+    "zone et titres d'impression relus")
+
+  expect_error(function() xlsx.new():add_sheet("x"):add_image_data("bad", "png", 0, 0) end,
+    "image invalide refusée")
+  expect_error(function()
+    local b=xlsx.new(); local x=b:add_sheet("x"); x:write_rows({{"A","B"},{1,2}}); x:add_chart({type="pie",categories="A2:A2",series={{values="B2:B2"}}})
+  end, "type de graphique non pris en charge refusé")
+  expect_error(function()
+    local b=xlsx.new(); local x=b:add_sheet("x"); x:write_rows({{"A","A"},{1,2}}); x:add_table("A1:B2",{name="T"})
+  end, "en-têtes de tableau dupliqués refusés")
+  expect_error(function() xlsx.new():add_sheet("x"):set_page_setup({ scale=100, fit_to_width=1 }) end,
+    "scale et ajustement simultanés refusés")
+  expect_error(function() xlsx.new():add_sheet("x"):set_print_titles({ rows="2:1" }) end,
+    "titres d'impression inversés refusés")
 end
 
 os.remove(TMP)

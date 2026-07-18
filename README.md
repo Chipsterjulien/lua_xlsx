@@ -24,8 +24,12 @@ constituent la cible principale et recommandée.
   doublons et formules personnalisées.
 - Commentaires de cellules, hyperliens externes et internes, feuille active
   et plages nommées globales ou locales.
+- Rapports : images PNG/JPEG, graphiques linéaires ou en barres/colonnes,
+  tableaux structurés Excel, zones d’impression, titres répétés, marges,
+  orientation, papier, en-têtes et pieds de page.
 - Lecture des formules, styles, dimensions, fusions, volets, filtres, liens,
-  validations, règles conditionnelles, commentaires et propriétés de feuilles.
+  validations, règles conditionnelles, commentaires, propriétés de feuilles,
+  images, graphiques, tableaux et paramètres d’impression.
 - Lecture des ZIP XLSX STORED ou DEFLATE avec un décompresseur DEFLATE Lua.
 - Contrôle du CRC-32, des tailles, des offsets, des doublons, du chiffrement,
   des chevauchements et des rapports de compression.
@@ -102,6 +106,20 @@ sh:add_conditional_format("B3:B100", {
 sh:set_comment(2, 0, { author = "Julien", text = "Valeur contrôlée." })
 sh:set_column_hidden(4, true)
 sh:set_tab_color("4472C4")
+sh:add_table("A2:D3", { name = "RapportTable", style = "TableStyleMedium2" })
+sh:add_chart({
+  type = "column", title = "Montants", categories = "A3:A3",
+  series = { { name_ref = "B2", values = "B3:B3" } },
+  row = 1, col = 5,
+})
+sh:set_page_setup({
+  orientation = "landscape", paper_size = "a4",
+  fit_to_width = 1, fit_to_height = 0,
+})
+sh:set_header_footer({ header_center = "Rapport", footer_right = "Page &P / &N" })
+sh:set_print_area("A1:J30")
+sh:set_print_titles({ rows = "1:2", columns = "A:A" })
+
 wb:define_name("ZoneMontants", "'Rapport'!$B$3:$B$100")
 wb:set_active_sheet("Rapport")
 
@@ -145,6 +163,11 @@ print(#sh:get_data_validations(), #sh:get_conditional_formats())
 local comment = sh:get_comment(2, 0)
 print(comment and comment.author, comment and comment.text)
 print(wb:get_active_sheet(), #wb:get_defined_names())
+print(#sh:get_images(), #sh:get_charts(), #sh:get_tables())
+local page = sh:get_page_setup()
+local repeat_rows, repeat_cols = sh:get_print_titles()
+print(page and page.orientation, sh:get_print_area(), repeat_rows, repeat_cols)
+
 ```
 
 Les dates sont renvoyées sous forme ISO 8601, par exemple `2026-07-18` ou
@@ -212,7 +235,7 @@ Le script :
 1. cherche Babet dans `BABET_BIN`, puis dans `bin/babet`, puis dans le `PATH` ;
 2. teste aussi un interpréteur Lua standard trouvé sur le système ;
 3. crée un environnement virtuel Python temporaire ;
-4. y installe `openpyxl>=3.1,<4` avec `pip` ;
+4. y installe `openpyxl>=3.1,<4` et `Pillow>=10,<12` avec `pip` ;
 5. exécute l'aller-retour `openpyxl` séparément avec Babet et Lua standard lorsqu'ils sont disponibles ;
 6. supprime le venv, le cache `pip` et tous les fichiers temporaires à la fin, y compris après un échec.
 
@@ -234,7 +257,7 @@ Variables utiles :
 ```sh
 BABET_BIN=/chemin/vers/babet ./run_tests.sh
 LUA_BIN=/chemin/vers/lua5.5 ./run_tests.sh
-OPENPYXL_SPEC='openpyxl==3.1.5' ./run_tests.sh
+OPENPYXL_SPEC='openpyxl==3.1.5' PILLOW_SPEC='pillow==11.3.0' ./run_tests.sh
 ```
 
 ## Documentation PDF
@@ -249,8 +272,8 @@ fichiers Markdown. Il nécessite Pandoc et XeLaTeX ou LuaLaTeX.
 
 ## Limites actuelles
 
-- Pas de graphiques, images, tableaux structurés, tableaux croisés dynamiques
-  ni macros XLSM.
+- Pas de tableaux croisés dynamiques, macros XLSM, graphiques combinés,
+  graphiques circulaires, images SVG ou mise en page avancée par zones multiples.
 - La mise en forme conditionnelle se limite aux règles simples documentées ;
   les barres de données, jeux d'icônes et échelles de couleurs ne sont pas pris
   en charge.

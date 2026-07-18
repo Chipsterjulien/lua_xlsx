@@ -3,7 +3,7 @@
 Référence des modules `xlsx` et `dataframe`. La cible principale est Babet avec
 Lua 5.5, mais le cœur reste compatible avec Lua standard 5.3+.
 
-Documentation de lua-xlsx 1.3.0.
+Documentation de lua-xlsx 1.4.0.
 
 ## Table des matières
 
@@ -11,6 +11,7 @@ Documentation de lua-xlsx 1.3.0.
 - [Conventions](#conventions)
 - [Écriture XLSX](#écriture-xlsx)
 - [Styles, structure, mise en page, hyperliens et formules](#styles-structure-mise-en-page-hyperliens-et-formules)
+- [Rapports, graphiques, images et impression](#rapports-graphiques-images-et-impression)
 - [Dates 1900 et 1904](#dates-1900-et-1904)
 - [Lecture XLSX](#lecture-xlsx)
 - [Limites et validation ZIP](#limites-et-validation-zip)
@@ -164,14 +165,14 @@ sh:write_rows({
 
 ## Styles, structure, mise en page, hyperliens et formules
 
-La version 1.3.0 écrit ces informations et expose également leur sous-ensemble
+La version 1.4.0 écrit ces informations et expose également leur sous-ensemble
 pris en charge dans l'API de lecture. Les objets `style`, `formula` et
 `hyperlink` sont immuables.
 
 ### `xlsx.VERSION`
 
 ```lua
-assert(xlsx.VERSION == "1.3.0")
+assert(xlsx.VERSION == "1.4.0")
 ```
 
 ### `xlsx.style([opts]) -> style`
@@ -734,7 +735,7 @@ wb:remove_defined_name("TauxTVA")
 wb:remove_defined_name("TotalLocal", { local_sheet = "Synthèse" })
 ```
 
-### Exemple combiné 1.3.0
+### Exemple combiné 1.3.0 (fonctionnalités conservées)
 
 ```lua
 local xlsx = require("xlsx")
@@ -890,6 +891,387 @@ assert(xlsx.write_rows("résultat.xlsx", {
 ```
 
 ---
+
+
+## Rapports, graphiques, images et impression
+
+La version 1.4.0 ajoute les composants nécessaires aux rapports et tableaux de
+bord simples. Une feuille peut contenir un drawing unique regroupant plusieurs
+images et graphiques, plusieurs tableaux structurés et des paramètres
+d'impression indépendants.
+
+### Images PNG et JPEG
+
+#### `sheet:add_image(path, row, col [, opts]) -> sheet`
+
+Lit une image depuis un fichier et l'ancre à une cellule 0-indexée.
+
+```lua
+sh:add_image("logo.png", 0, 5)
+```
+
+Options :
+
+| Option | Défaut | Comportement |
+|---|---:|---|
+| `width` | largeur native | largeur en pixels, de 1 à 10000 |
+| `height` | hauteur native | hauteur en pixels, de 1 à 10000 |
+| `alt_text` | absent | description accessible, 1000 octets maximum |
+| `name` | généré | nom de l'objet image, 255 octets maximum |
+
+Fournir seulement la largeur conserve le rapport hauteur/largeur :
+
+```lua
+sh:add_image("logo.png", 1, 5, { width = 160 })
+```
+
+Fournir seulement la hauteur conserve également les proportions :
+
+```lua
+sh:add_image("photo.jpg", 8, 0, { height = 120 })
+```
+
+Texte alternatif et nom explicite :
+
+```lua
+sh:add_image("logo.png", 0, 5, {
+  width = 160,
+  alt_text = "Logo du projet lua-xlsx",
+  name = "Logo principal",
+})
+```
+
+Seuls PNG et JPEG sont pris en charge. Le format est détecté par le contenu,
+pas uniquement par l'extension.
+
+#### `sheet:add_image_data(data, format, row, col [, opts]) -> sheet`
+
+Ajoute directement une chaîne Lua binaire sans fichier temporaire :
+
+```lua
+local f = assert(io.open("logo.png", "rb"))
+local bytes = assert(f:read("a"))
+assert(f:close())
+
+sh:add_image_data(bytes, "png", 0, 5, {
+  width = 160,
+  alt_text = "Logo chargé en mémoire",
+})
+```
+
+`format` accepte `png`, `jpeg` ou `jpg`. Une incohérence entre le format annoncé
+et les octets réels est refusée.
+
+#### `sheet:remove_image(index) -> sheet`
+
+Les indices sont 1-based dans l'ordre d'ajout :
+
+```lua
+sh:remove_image(1)
+```
+
+### Graphiques simples
+
+#### `sheet:add_chart(opts) -> sheet`
+
+Types pris en charge :
+
+- `line` : courbe ;
+- `column` : colonnes verticales ;
+- `bar` : barres horizontales.
+
+Graphique à une série :
+
+```lua
+sh:add_chart({
+  type = "line",
+  title = "Ventes mensuelles",
+  categories = "A2:A13",
+  series = {
+    { name_ref = "B1", values = "B2:B13" },
+  },
+  row = 1,
+  col = 5,
+})
+```
+
+Chaque référence est interprétée dans la feuille courante puis écrite sous
+forme absolue dans le graphique. Une série accepte soit `name`, soit
+`name_ref` :
+
+```lua
+sh:add_chart({
+  type = "column",
+  categories = "A2:A13",
+  series = {
+    { name = "Réalisé", values = "B2:B13" },
+    { name = "Objectif", values = "C2:C13" },
+  },
+  row = 15,
+  col = 0,
+  width = 700,
+  height = 360,
+  legend = true,
+})
+```
+
+Options principales :
+
+| Option | Défaut | Comportement |
+|---|---:|---|
+| `type` | `column` | `line`, `column` ou `bar` |
+| `title` | absent | titre Unicode |
+| `categories` | obligatoire | plage A1 de catégories |
+| `series` | obligatoire | 1 à 255 séries |
+| `row`, `col` | `0`, `0` | cellule d'ancrage 0-indexée |
+| `width`, `height` | `640`, `360` | dimensions en pixels |
+| `legend` | `true` | affiche ou masque la légende |
+
+lua-xlsx écrit les références de données mais ne calcule ni ne met en cache les
+points du graphique. Excel, LibreOffice ou openpyxl résolvent les plages lors de
+l'ouverture.
+
+#### `sheet:remove_chart(index) -> sheet`
+
+```lua
+sh:remove_chart(1)
+```
+
+### Tableaux structurés Excel
+
+#### `sheet:add_table(ref [, opts]) -> sheet`
+
+La plage doit contenir une ligne d'en-tête et au moins une ligne de données.
+Chaque en-tête doit être une chaîne non vide et unique sans distinction de
+casse.
+
+```lua
+sh:add_table("A1:D100", {
+  name = "VentesTable",
+})
+```
+
+Style et bandes alternées :
+
+```lua
+sh:add_table("A1:D100", {
+  name = "VentesTable",
+  style = "TableStyleMedium4",
+  show_row_stripes = true,
+  show_column_stripes = false,
+})
+```
+
+Options :
+
+| Option | Défaut |
+|---|---:|
+| `name` | `TableN` dans la feuille |
+| `style` | `TableStyleMedium2` |
+| `show_first_column` | `false` |
+| `show_last_column` | `false` |
+| `show_row_stripes` | `true` |
+| `show_column_stripes` | `false` |
+
+Les noms de tableaux sont uniques dans tout le classeur. Deux tableaux d'une
+même feuille ne peuvent pas se chevaucher.
+
+#### `sheet:remove_table(name) -> sheet`
+
+```lua
+sh:remove_table("VentesTable")
+```
+
+### Orientation, papier et mise à l'échelle
+
+#### `sheet:set_page_setup(opts) -> sheet`
+
+Orientation paysage et papier A4 :
+
+```lua
+sh:set_page_setup({
+  orientation = "landscape",
+  paper_size = "a4",
+})
+```
+
+Ajuster le document à une page en largeur sans limiter la hauteur :
+
+```lua
+sh:set_page_setup({
+  orientation = "landscape",
+  paper_size = "a4",
+  fit_to_width = 1,
+  fit_to_height = 0,
+})
+```
+
+Échelle fixe :
+
+```lua
+sh:set_page_setup({ scale = 85 })
+```
+
+`scale` accepte 10 à 400 et ne peut pas être combiné avec `fit_to_width` ou
+`fit_to_height`.
+
+Centrage et éléments imprimés :
+
+```lua
+sh:set_page_setup({
+  horizontal_centered = true,
+  vertical_centered = false,
+  grid_lines = true,
+  headings = true,
+})
+```
+
+`paper_size` accepte `letter`, `legal`, `a3`, `a4`, `a5` ou un identifiant
+OOXML entier de 1 à 118. Passer `false` retire la configuration.
+
+### Marges
+
+#### `sheet:set_page_margins(opts) -> sheet`
+
+Les valeurs sont exprimées en pouces :
+
+```lua
+sh:set_page_margins({
+  left = 0.4,
+  right = 0.4,
+  top = 0.5,
+  bottom = 0.5,
+  header = 0.3,
+  footer = 0.3,
+})
+```
+
+Les champs absents utilisent les valeurs Excel classiques. Passer `false`
+retire les marges explicites.
+
+### En-têtes et pieds de page
+
+#### `sheet:set_header_footer(opts) -> sheet`
+
+Chaque zone est indépendante :
+
+```lua
+sh:set_header_footer({
+  header_left = "lua-xlsx",
+  header_center = "Rapport annuel",
+  header_right = "&D",
+  footer_left = "Confidentiel",
+  footer_center = "&F",
+  footer_right = "Page &P / &N",
+})
+```
+
+Les codes Excel tels que `&P` (page), `&N` (nombre de pages), `&D` (date) et
+`&F` (nom du fichier) sont conservés. `different_first` et
+`different_odd_even` sont également acceptés. Passer `false` supprime la
+configuration.
+
+### Zone d'impression et titres répétés
+
+#### `sheet:set_print_area(ref) -> sheet`
+
+```lua
+sh:set_print_area("A1:J60")
+```
+
+La zone est enregistrée comme nom défini local `_xlnm.Print_Area`. Passer
+`false` la retire.
+
+#### `sheet:set_print_titles(opts) -> sheet`
+
+Répéter la première ligne sur chaque page :
+
+```lua
+sh:set_print_titles({ rows = "1:1" })
+```
+
+Répéter deux lignes et la première colonne :
+
+```lua
+sh:set_print_titles({
+  rows = "1:2",
+  columns = "A:A",
+})
+```
+
+Les lignes utilisent la forme `1:2`; les colonnes utilisent `A:B`. Passer
+`false` retire les titres répétés.
+
+### Lecture des métadonnées 1.4
+
+```lua
+local images = sh:get_images()
+local charts = sh:get_charts()
+local tables = sh:get_tables()
+local margins = sh:get_page_margins()
+local page = sh:get_page_setup()
+local header_footer = sh:get_header_footer()
+local print_area = sh:get_print_area()
+local repeat_rows, repeat_cols = sh:get_print_titles()
+```
+
+`get_images()` fournit les octets binaires, le format, l'ancrage, les dimensions,
+le nom et le texte alternatif. `get_charts()` expose le type, le titre, les
+références de catégories et de séries ainsi que l'ancrage. `get_tables()` expose
+le nom, la plage, le style et les en-têtes.
+
+### Exemple combiné de rapport 1.4.0
+
+```lua
+local xlsx = require("xlsx")
+
+local wb = xlsx.new()
+local sh = wb:add_sheet("Tableau de bord")
+sh:write_rows({
+  { "Mois", "Réalisé", "Objectif" },
+  { "Janvier", 120, 100 },
+  { "Février", 135, 130 },
+  { "Mars", 128, 140 },
+})
+
+sh:add_table("A1:C4", {
+  name = "VentesTable",
+  style = "TableStyleMedium4",
+})
+sh:add_image("logo.png", 0, 5, {
+  width = 140,
+  alt_text = "Logo de l'entreprise",
+})
+sh:add_chart({
+  type = "column",
+  title = "Réalisé contre objectif",
+  categories = "A2:A4",
+  series = {
+    { name_ref = "B1", values = "B2:B4" },
+    { name_ref = "C1", values = "C2:C4" },
+  },
+  row = 6,
+  col = 0,
+  width = 720,
+  height = 380,
+})
+sh:set_page_setup({
+  orientation = "landscape",
+  paper_size = "a4",
+  fit_to_width = 1,
+  fit_to_height = 0,
+  horizontal_centered = true,
+})
+sh:set_page_margins({ left = 0.4, right = 0.4, top = 0.5, bottom = 0.5 })
+sh:set_header_footer({
+  header_center = "Tableau de bord des ventes",
+  footer_right = "Page &P / &N",
+})
+sh:set_print_area("A1:J30")
+sh:set_print_titles({ rows = "1:1", columns = "A:A" })
+
+assert(wb:save("tableau-de-bord.xlsx"))
+```
 
 ## Dates 1900 et 1904
 
@@ -1453,7 +1835,7 @@ Babet est recherché dans cet ordre :
 3. commande `babet` disponible dans le `PATH`.
 
 Le script crée ensuite un venv Python temporaire, installe
-`openpyxl>=3.1,<4`, exécute l'interopérabilité séparément avec Babet et Lua
+`openpyxl>=3.1,<4` et `Pillow>=10,<12`, exécute l'interopérabilité séparément avec Babet et Lua
 standard lorsqu'ils sont disponibles, puis supprime le venv, le cache `pip` et
 les fichiers temporaires. Le nettoyage est assuré aussi lorsqu'un test échoue.
 Une installation globale d'`openpyxl` n'est donc ni utilisée ni nécessaire.
@@ -1475,7 +1857,7 @@ Forcer les runtimes ou la version d'`openpyxl` :
 ```sh
 BABET_BIN=../babet/bin/babet ./run_tests.sh
 LUA_BIN=/usr/bin/lua5.5 ./run_tests.sh
-OPENPYXL_SPEC='openpyxl==3.1.5' ./run_tests.sh
+OPENPYXL_SPEC='openpyxl==3.1.5' PILLOW_SPEC='pillow==11.3.0' ./run_tests.sh
 ```
 
 ---
@@ -1501,8 +1883,8 @@ temporaire et ne laisse pas les fichiers auxiliaires LaTeX dans le projet.
 
 - Écriture ZIP STORED uniquement ; lecture STORED et DEFLATE.
 - Pas de ZIP64 dans le parseur Lua interne.
-- Pas de graphiques, images, tableaux structurés, tableaux croisés dynamiques
-  ni macros XLSM.
+- Pas de tableaux croisés dynamiques, macros XLSM, graphiques combinés,
+  graphiques circulaires, images SVG ou mise en page avancée par zones multiples.
 - La mise en forme conditionnelle se limite aux règles simples documentées ;
   les barres de données, jeux d’icônes et échelles de couleurs ne sont pas pris
   en charge.

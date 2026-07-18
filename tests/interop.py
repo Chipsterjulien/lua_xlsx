@@ -6,6 +6,10 @@ from datetime import datetime
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.chart import LineChart, Reference
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from PIL import Image as PILImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.comments import Comment
 from openpyxl.formatting.rule import CellIsRule
@@ -64,6 +68,38 @@ def prepare(path: Path) -> None:
             fill=PatternFill(fill_type="solid", fgColor="FFFFC7CE"),
         ),
     )
+    # Fonctionnalités 1.4 : image, graphique, tableau et impression.
+    image_path = path.with_suffix(".png")
+    PILImage.new("RGB", (20, 10), (30, 144, 255)).save(image_path)
+    picture = XLImage(str(image_path))
+    picture.width = 80
+    picture.height = 40
+    ws.add_image(picture, "F2")
+
+    input_table = Table(displayName="InputTable", ref="A1:D3")
+    input_table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium4", showFirstColumn=False,
+        showLastColumn=False, showRowStripes=True, showColumnStripes=False,
+    )
+    ws.add_table(input_table)
+    chart = LineChart()
+    chart.title = "Tendance openpyxl"
+    chart.add_data(Reference(ws, min_col=2, min_row=1, max_row=3), titles_from_data=True)
+    chart.set_categories(Reference(ws, min_col=1, min_row=2, max_row=3))
+    ws.add_chart(chart, "F8")
+
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins.left = 0.4
+    ws.oddHeader.center.text = "OpenPyXL"
+    ws.oddFooter.right.text = "Page &P / &N"
+    ws.print_area = "A1:D10"
+    ws.print_title_rows = "1:1"
+    ws.print_title_cols = "A:A"
+
     target = wb.create_sheet("Cible")
     target["A1"] = "destination"
     hidden = wb.create_sheet("Masquée")
@@ -74,6 +110,7 @@ def prepare(path: Path) -> None:
     wb.defined_names.add(DefinedName("ZoneNoms", attr_text="'Entrée'!$A$2:$A$10"))
     wb.defined_names.add(DefinedName("ValeurLocale", attr_text="'Entrée'!$B$2", localSheetId=0, hidden=True))
     wb.save(path)
+    image_path.unlink(missing_ok=True)
     print(f"Fixture openpyxl créée : {path}")
 
 
@@ -83,7 +120,7 @@ def check(path: Path) -> None:
     assert wb.sheetnames == ["Résumé", "Cible", "Masquée", "Très masquée"]
     ws = wb["Résumé"]
 
-    assert ws["A1"].value == "Rapport 1.3"
+    assert ws["A1"].value == "Rapport 1.4"
     assert str(next(iter(ws.merged_cells.ranges))) == "A1:D1"
     assert ws["A3"].value == "Élise & <test>"
     assert ws["B3"].value == 12.5
@@ -145,6 +182,24 @@ def check(path: Path) -> None:
     assert names["ZoneNoms"].attr_text == "'Résumé'!$A$3:$A$20"
     local_name = ws.defined_names["ValeurLocale"]
     assert local_name.localSheetId == 0 and local_name.hidden is True
+
+    assert len(ws._images) == 1
+    assert ws._images[0].anchor._from.row == 6
+    assert ws._images[0].anchor._from.col == 0
+    assert len(ws._charts) == 1
+    assert ws._charts[0].title is not None
+    assert list(ws.tables) == ["ResumeTable"]
+    assert ws.tables["ResumeTable"].ref == "A2:D4"
+    assert ws.page_setup.orientation == "landscape"
+    assert ws.page_setup.paperSize == 9
+    assert ws.page_setup.fitToWidth == 1
+    assert ws.page_setup.fitToHeight == 0
+    assert ws.page_margins.left == 0.4
+    assert ws.oddHeader.center.text == "lua-xlsx 1.4"
+    assert ws.oddFooter.right.text == "Page &P / &N"
+    assert str(ws.print_area) == "'Résumé'!$A$1:$J$30"
+    assert ws.print_title_rows == "$1:$2"
+    assert ws.print_title_cols == "$A:$A"
 
     data_wb = load_workbook(path, data_only=True)
     data_ws = data_wb["Résumé"]
