@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils.datetime import CALENDAR_MAC_1904
 
 
@@ -14,8 +15,31 @@ def prepare(path: Path) -> None:
     wb.epoch = CALENDAR_MAC_1904
     ws = wb.active
     ws.title = "Entrée"
-    ws.append(["Nom", "Actif", "Date"])
-    ws.append(["Zoé", False, datetime(2025, 1, 2, 3, 4, 5)])
+    ws.append(["Nom", "Actif", "Date", "Formule"])
+    ws.append(["Zoé", False, datetime(2025, 1, 2, 3, 4, 5), "=SUM(1,2)"])
+    ws.append(["Autre", True, datetime(2025, 1, 3, 4, 5, 6), 7])
+    ws["A2"].hyperlink = "https://example.org/source?a=1&b=2"
+    ws["A2"].hyperlink.tooltip = "Source externe"
+    ws["B2"].font = Font(
+        name="DejaVu Sans", size=13, bold=True, italic=True,
+        underline="single", strike=True, color="FF123456",
+    )
+    ws["B2"].fill = PatternFill(fill_type="solid", fgColor="FFABCDEF")
+    ws["B2"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws["B2"].border = Border(
+        left=Side(style="thin", color="FFFF0000"),
+        right=Side(style="double"),
+        top=Side(style="dashed", color="FF00AA00"),
+        bottom=Side(style="dotted"),
+    )
+    ws.column_dimensions["A"].width = 20
+    ws.row_dimensions[1].height = 26
+    ws.freeze_panes = "C2"
+    ws.auto_filter.ref = "A1:D3"
+    ws.merge_cells("A4:C4")
+    ws["A4"] = "Fusion openpyxl"
+    target = wb.create_sheet("Cible")
+    target["A1"] = "destination"
     wb.save(path)
     print(f"Fixture openpyxl créée : {path}")
 
@@ -23,21 +47,28 @@ def prepare(path: Path) -> None:
 def check(path: Path) -> None:
     wb = load_workbook(path, data_only=False)
     assert wb.epoch == CALENDAR_MAC_1904
-    assert wb.sheetnames == ["Résumé"]
+    assert wb.sheetnames == ["Résumé", "Cible"]
     ws = wb["Résumé"]
 
-    assert ws["A2"].value == "Élise & <test>"
-    assert ws["B2"].value == 12.5
-    assert ws["C2"].value == datetime(2024, 3, 15, 13, 45, 30)
-    assert ws["D4"].value == "=SUM(B2:B3)"
+    assert ws["A1"].value == "Rapport 1.2"
+    assert str(next(iter(ws.merged_cells.ranges))) == "A1:D1"
+    assert ws["A3"].value == "Élise & <test>"
+    assert ws["B3"].value == 12.5
+    assert ws["C3"].value == datetime(2024, 3, 15, 13, 45, 30)
+    assert ws["D5"].value == "=SUM(B3:B4)"
 
-    assert ws.freeze_panes == "B2"
-    assert ws.auto_filter.ref == "A1:D3"
+    assert ws.freeze_panes == "B3"
+    assert ws.auto_filter.ref == "A2:D4"
     assert ws.column_dimensions["A"].width == 18.0
     assert ws.column_dimensions["B"].width == 14.0
-    assert ws.row_dimensions[1].height == 24.0
+    assert ws.row_dimensions[1].height == 28.0
 
     assert ws["A1"].font.bold is True
+    assert ws["A1"].font.italic is True
+    assert ws["A1"].font.name == "Liberation Sans"
+    assert ws["A1"].font.sz == 14.0
+    assert ws["A1"].font.underline == "double"
+    assert ws["A1"].font.strike is True
     assert ws["A1"].font.color.type == "rgb"
     assert ws["A1"].font.color.rgb == "FF112233"
     assert ws["A1"].fill.fill_type == "solid"
@@ -45,14 +76,24 @@ def check(path: Path) -> None:
     assert ws["A1"].alignment.horizontal == "center"
     assert ws["A1"].alignment.vertical == "center"
     assert ws["A1"].alignment.wrap_text is True
-    assert ws["B2"].number_format == '#,##0.00 "€"'
-    assert ws["C2"].font.bold is True
-    assert ws["C2"].number_format == "yyyy-mm-dd hh:mm:ss"
+    assert ws["A1"].border.left.style == "thin"
+    assert ws["A1"].border.left.color.rgb == "FFFF0000"
+    assert ws["A1"].border.right.style == "double"
+    assert ws["A1"].border.top.style == "dashed"
+    assert ws["A1"].border.bottom.style == "dotted"
+
+    assert ws["B3"].number_format == '#,##0.00 "€"'
+    assert ws["C3"].font.bold is True
+    assert ws["C3"].number_format == "yyyy-mm-dd hh:mm:ss"
+
+    assert ws["D3"].hyperlink.target == "https://example.com/?a=1&b=2"
+    assert ws["D3"].hyperlink.tooltip == "Ouvrir le site"
+    assert ws["D4"].hyperlink.location == "'Cible'!A1"
 
     data_wb = load_workbook(path, data_only=True)
     data_ws = data_wb["Résumé"]
-    assert data_ws["C2"].value == datetime(2024, 3, 15, 13, 45, 30)
-    assert data_ws["D4"].value is None
+    assert data_ws["C3"].value == datetime(2024, 3, 15, 13, 45, 30)
+    assert data_ws["D5"].value == 19.75
 
     print("INTEROP OPENPYXL : PASS")
 

@@ -21,7 +21,7 @@
 --- d'archive et d'écriture atomique. Sans Babet, un chemin de repli Lua pur
 --- conserve l'API et applique ses propres contrôles de taille, CRC et ZIP.
 
-local xlsx = { VERSION = "1.1.0" }
+local xlsx = { VERSION = "1.2.0" }
 
 local function get_babet()
   local runtime = rawget(_G, "babet")
@@ -244,11 +244,22 @@ function xlsx.date_to_serial(y, m, d, h, mi, sec, date1904)
 end
 
 -- ----------------------------------------------------------------------------
--- Formules et styles d'écriture
+-- Formules, hyperliens et styles d'écriture
 -- ----------------------------------------------------------------------------
-local FORMULA_MT, STYLE_MT = {}, {}
+local FORMULA_MT, HYPERLINK_MT, STYLE_MT = {}, {}, {}
 local FORMULA_DATA = setmetatable({}, { __mode = "k" })
+local HYPERLINK_DATA = setmetatable({}, { __mode = "k" })
 local STYLE_DATA = setmetatable({}, { __mode = "k" })
+
+local function copy_border(border)
+  if not border then return nil end
+  local out = {}
+  for _, side in ipairs({ "left", "right", "top", "bottom" }) do
+    local src = border[side]
+    if src then out[side] = { style = src.style, color = src.color } end
+  end
+  return next(out) and out or nil
+end
 
 FORMULA_MT.__index = function(self, key)
   local data = FORMULA_DATA[self]
@@ -258,23 +269,98 @@ FORMULA_MT.__newindex = function()
   error("xlsx: une formule est immuable", 2)
 end
 
+HYPERLINK_MT.__index = function(self, key)
+  local data = HYPERLINK_DATA[self]
+  return data and data[key] or nil
+end
+HYPERLINK_MT.__newindex = function()
+  error("xlsx: un hyperlien est immuable", 2)
+end
+
 STYLE_MT.__index = function(self, key)
   local data = STYLE_DATA[self]
-  return data and data[key] or nil
+  if not data then return nil end
+  if key == "border" then return copy_border(data.border) end
+  return data[key]
 end
 STYLE_MT.__newindex = function()
   error("xlsx: un style est immuable", 2)
 end
 
+local function validate_cached_value(value, level)
+  if value == nil then return end
+  local t = type(value)
+  if t ~= "string" and t ~= "number" and t ~= "boolean" then
+    error("xlsx: la valeur mise en cache d'une formule doit être string, number, boolean ou nil", level or 3)
+  end
+  if t == "string" then validate_xml_text(value, "valeur mise en cache", level or 3) end
+  if t == "number" and (value ~= value or value == math.huge or value == -math.huge) then
+    error("xlsx: la valeur mise en cache d'une formule doit être finie", level or 3)
+  end
+end
+
+local function new_formula(data)
+  local obj = setmetatable({}, FORMULA_MT)
+  FORMULA_DATA[obj] = data
+  return obj
+end
+
 --- Crée une formule. Le signe = initial est facultatif.
-function xlsx.formula(expression)
+--- cached_value est facultatif et permet d'écrire une valeur mise en cache.
+function xlsx.formula(expression, cached_value)
   if type(expression) ~= "string" then error("xlsx: formula attend une string", 2) end
   validate_xml_text(expression, "formule", 3)
   if expression:sub(1, 1) == "=" then expression = expression:sub(2) end
   if expression == "" then error("xlsx: une formule ne peut pas être vide", 2) end
-  local obj = setmetatable({}, FORMULA_MT)
-  FORMULA_DATA[obj] = { expression = expression }
+  validate_cached_value(cached_value, 3)
+  return new_formula({ expression = expression, cached_value = cached_value, formula_type = "normal" })
+end
+
+function xlsx.is_formula(value)
+  return getmetatable(value) == FORMULA_MT and FORMULA_DATA[value] ~= nil
+end
+
+local function new_hyperlink(data)
+  local obj = setmetatable({}, HYPERLINK_MT)
+  HYPERLINK_DATA[obj] = data
   return obj
+end
+
+local function normalize_hyperlink(target, text, opts, level)
+  if type(target) ~= "string" or target == "" then
+    error("xlsx: la cible d'un hyperlien doit être une string non vide", level or 3)
+  end
+  validate_xml_text(target, "cible d'hyperlien", level or 3)
+  if #target > 32767 then error("xlsx: la cible d'hyperlien dépasse 32767 octets", level or 3) end
+  opts = opts or {}
+  if type(opts) ~= "table" then error("xlsx: les options d'hyperlien doivent être une table", level or 3) end
+  local allowed = { internal=true, tooltip=true }
+  for k in pairs(opts) do
+    if not allowed[k] then error("xlsx: option d'hyperlien inconnue : " .. tostring(k), level or 3) end
+  end
+  local internal = opts.internal == true
+  if opts.internal ~= nil and type(opts.internal) ~= "boolean" then
+    error("xlsx: internal doit être un booléen", level or 3)
+  end
+  if text == nil then text = target end
+  if type(text) ~= "string" then error("xlsx: le texte d'un hyperlien doit être une string", level or 3) end
+  validate_xml_text(text, "texte d'hyperlien", level or 3)
+  local tooltip = opts.tooltip
+  if tooltip ~= nil then
+    if type(tooltip) ~= "string" then error("xlsx: tooltip doit être une string", level or 3) end
+    validate_xml_text(tooltip, "infobulle d'hyperlien", level or 3)
+    if #tooltip > 255 then error("xlsx: tooltip dépasse 255 octets", level or 3) end
+  end
+  return { target=target, text=text, internal=internal, tooltip=tooltip }
+end
+
+--- Crée une valeur hyperlien pouvant être passée directement à write().
+function xlsx.hyperlink(target, text, opts)
+  return new_hyperlink(normalize_hyperlink(target, text, opts, 3))
+end
+
+function xlsx.is_hyperlink(value)
+  return getmetatable(value) == HYPERLINK_MT and HYPERLINK_DATA[value] ~= nil
 end
 
 local NUMBER_FORMAT_ALIASES = {
@@ -288,6 +374,10 @@ local NUMBER_FORMAT_ALIASES = {
   datetime = "yyyy-mm-dd hh:mm:ss",
 }
 
+local BORDER_STYLES = {
+  thin=true, medium=true, thick=true, dashed=true, dotted=true, double=true,
+}
+
 local function normalize_color(value, what, level)
   if value == nil then return nil end
   if type(value) ~= "string" then error("xlsx: " .. what .. " doit être une couleur RGB/ARGB", level or 3) end
@@ -299,22 +389,77 @@ local function normalize_color(value, what, level)
   return value:upper()
 end
 
+local function normalize_border(border, level)
+  if border == nil then return nil end
+  if type(border) ~= "table" then error("xlsx: border doit être une table", level or 3) end
+  local out = {}
+  for key in pairs(border) do
+    if key ~= "left" and key ~= "right" and key ~= "top" and key ~= "bottom" then
+      error("xlsx: côté de bordure inconnu : " .. tostring(key), level or 3)
+    end
+  end
+  for _, side in ipairs({ "left", "right", "top", "bottom" }) do
+    local src = border[side]
+    if src ~= nil then
+      if type(src) ~= "table" then error("xlsx: border." .. side .. " doit être une table", level or 3) end
+      for key in pairs(src) do
+        if key ~= "style" and key ~= "color" then
+          error("xlsx: option de bordure inconnue : " .. side .. "." .. tostring(key), level or 3)
+        end
+      end
+      local style = src.style
+      if type(style) ~= "string" or not BORDER_STYLES[style] then
+        error("xlsx: border." .. side .. ".style doit valoir thin, medium, thick, dashed, dotted ou double", level or 3)
+      end
+      out[side] = {
+        style = style,
+        color = normalize_color(src.color, "border." .. side .. ".color", level or 3),
+      }
+    end
+  end
+  return next(out) and out or nil
+end
+
 local function normalize_style(opts, level)
   if type(opts) ~= "table" then error("xlsx: style attend une table d'options", level or 3) end
   local allowed = {
-    bold=true, italic=true, font_color=true, fill_color=true,
-    horizontal=true, vertical=true, wrap_text=true, number_format=true,
+    bold=true, italic=true, underline=true, strike=true,
+    font_name=true, font_size=true, font_color=true, fill_color=true,
+    horizontal=true, vertical=true, wrap_text=true, number_format=true, border=true,
   }
   for k in pairs(opts) do
     if not allowed[k] then error("xlsx: option de style inconnue : " .. tostring(k), level or 3) end
   end
   local out = {}
-  for _, key in ipairs({ "bold", "italic", "wrap_text" }) do
+  for _, key in ipairs({ "bold", "italic", "strike", "wrap_text" }) do
     local value = opts[key]
     if value ~= nil and type(value) ~= "boolean" then
       error("xlsx: " .. key .. " doit être un booléen", level or 3)
     end
     out[key] = value == true
+  end
+  if opts.underline ~= nil then
+    if type(opts.underline) ~= "string" or
+        (opts.underline ~= "none" and opts.underline ~= "single" and opts.underline ~= "double") then
+      error("xlsx: underline doit valoir none, single ou double", level or 3)
+    end
+    if opts.underline ~= "none" then out.underline = opts.underline end
+  end
+  if opts.font_name ~= nil then
+    if type(opts.font_name) ~= "string" or opts.font_name == "" then
+      error("xlsx: font_name doit être une string non vide", level or 3)
+    end
+    validate_xml_text(opts.font_name, "nom de police", level or 3)
+    if #opts.font_name > 255 then error("xlsx: font_name dépasse 255 octets", level or 3) end
+    out.font_name = opts.font_name
+  end
+  if opts.font_size ~= nil then
+    local value = opts.font_size
+    if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge
+        or value < 1 or value > 409 then
+      error("xlsx: taille de police doit être un nombre fini entre 1 et 409", level or 3)
+    end
+    out.font_size = value
   end
   out.font_color = normalize_color(opts.font_color, "font_color", level or 3)
   out.fill_color = normalize_color(opts.fill_color, "fill_color", level or 3)
@@ -344,20 +489,46 @@ local function normalize_style(opts, level)
       out.number_format = opts.number_format
     end
   end
+  out.border = normalize_border(opts.border, level or 3)
   return out
+end
+
+local function copy_style_data(data)
+  return {
+    bold = data.bold == true, italic = data.italic == true,
+    underline = data.underline, strike = data.strike == true,
+    font_name = data.font_name, font_size = data.font_size,
+    font_color = data.font_color, fill_color = data.fill_color,
+    horizontal = data.horizontal, vertical = data.vertical,
+    wrap_text = data.wrap_text == true, number_format = data.number_format,
+    border = copy_border(data.border),
+  }
+end
+
+local function style_object_from_data(data)
+  local obj = setmetatable({}, STYLE_MT)
+  STYLE_DATA[obj] = copy_style_data(data)
+  return obj
 end
 
 --- Crée un style réutilisable et immuable.
 function xlsx.style(opts)
-  local data = normalize_style(opts or {}, 3)
-  local obj = setmetatable({}, STYLE_MT)
-  STYLE_DATA[obj] = data
-  return obj
+  return style_object_from_data(normalize_style(opts or {}, 3))
+end
+
+function xlsx.is_style(value)
+  return getmetatable(value) == STYLE_MT and STYLE_DATA[value] ~= nil
+end
+
+--- Renvoie une copie des options d'un style.
+function xlsx.style_options(style)
+  if not xlsx.is_style(style) then error("xlsx: style_options attend un style xlsx", 2) end
+  return copy_style_data(STYLE_DATA[style])
 end
 
 local function require_style(style, level)
   if style == nil then return nil end
-  if getmetatable(style) ~= STYLE_MT or not STYLE_DATA[style] then
+  if not xlsx.is_style(style) then
     error("xlsx: le style doit être créé avec xlsx.style", level or 3)
   end
   return STYLE_DATA[style]
@@ -368,44 +539,62 @@ local function key_part(value)
   return #value .. ":" .. value
 end
 
+local function border_key(border)
+  if not border then return "" end
+  local parts = {}
+  for _, side in ipairs({ "left", "right", "top", "bottom" }) do
+    local item = border[side]
+    parts[#parts + 1] = side .. "=" .. (item and (key_part(item.style) .. key_part(item.color)) or "")
+  end
+  return table.concat(parts, ";")
+end
+
 local function style_key(data)
   return table.concat({
     data.bold and "1" or "0", data.italic and "1" or "0",
+    key_part(data.underline), data.strike and "1" or "0",
+    key_part(data.font_name), key_part(data.font_size),
     key_part(data.font_color), key_part(data.fill_color),
     key_part(data.horizontal), key_part(data.vertical),
     data.wrap_text and "1" or "0", key_part(data.number_format),
+    key_part(border_key(data.border)),
   }, "|")
-end
-
-local function copy_style_data(data)
-  return {
-    bold = data.bold, italic = data.italic, font_color = data.font_color,
-    fill_color = data.fill_color, horizontal = data.horizontal,
-    vertical = data.vertical, wrap_text = data.wrap_text,
-    number_format = data.number_format,
-  }
 end
 
 local function new_style_registry()
   local reg = {
-    fonts = { { bold=false, italic=false, color=nil } },
-    font_map = { ["0|0|"] = 0 },
+    fonts = { { bold=false, italic=false, underline=nil, strike=false,
+      name="Calibri", size=11, color=nil } },
+    font_map = {},
     fills = { { kind="none" }, { kind="gray125" } },
     fill_map = {},
+    borders = { {} }, border_map = { [""] = 0 },
     numfmts = {}, numfmt_map = {},
-    xfs = { { fontId=0, fillId=0, numFmtId=0 } },
+    xfs = { { fontId=0, fillId=0, borderId=0, numFmtId=0 } },
     xf_map = {},
   }
-  reg.xf_map[style_key({ bold=false, italic=false, wrap_text=false })] = 0
+  reg.font_map[table.concat({"0","0",key_part(nil),"0",key_part("Calibri"),key_part(11),key_part(nil)}, "|")] = 0
+  reg.xf_map[style_key({ bold=false, italic=false, strike=false, wrap_text=false })] = 0
   return reg
 end
 
+local function font_key(data)
+  return table.concat({
+    data.bold and "1" or "0", data.italic and "1" or "0", key_part(data.underline),
+    data.strike and "1" or "0", key_part(data.font_name or "Calibri"),
+    key_part(data.font_size or 11), key_part(data.font_color),
+  }, "|")
+end
+
 local function register_font(reg, data)
-  local key = (data.bold and "1" or "0") .. "|" .. (data.italic and "1" or "0") .. "|" .. (data.font_color or "")
+  local key = font_key(data)
   local id = reg.font_map[key]
   if id ~= nil then return id end
   id = #reg.fonts
-  reg.fonts[#reg.fonts + 1] = { bold=data.bold, italic=data.italic, color=data.font_color }
+  reg.fonts[#reg.fonts + 1] = {
+    bold=data.bold, italic=data.italic, underline=data.underline, strike=data.strike,
+    name=data.font_name or "Calibri", size=data.font_size or 11, color=data.font_color,
+  }
   reg.font_map[key] = id
   return id
 end
@@ -417,6 +606,16 @@ local function register_fill(reg, color)
   id = #reg.fills
   reg.fills[#reg.fills + 1] = { kind="solid", color=color }
   reg.fill_map[color] = id
+  return id
+end
+
+local function register_border(reg, border)
+  local key = border_key(border)
+  local id = reg.border_map[key]
+  if id ~= nil then return id end
+  id = #reg.borders
+  reg.borders[#reg.borders + 1] = copy_border(border) or {}
+  reg.border_map[key] = id
   return id
 end
 
@@ -436,10 +635,11 @@ local function register_style(reg, data)
   if known ~= nil then return known end
   local fontId = register_font(reg, data)
   local fillId = register_fill(reg, data.fill_color)
+  local borderId = register_border(reg, data.border)
   local numFmtId = register_numfmt(reg, data.number_format)
   local id = #reg.xfs
   reg.xfs[#reg.xfs + 1] = {
-    fontId=fontId, fillId=fillId, numFmtId=numFmtId,
+    fontId=fontId, fillId=fillId, borderId=borderId, numFmtId=numFmtId,
     horizontal=data.horizontal, vertical=data.vertical, wrap_text=data.wrap_text,
   }
   reg.xf_map[key] = id
@@ -449,7 +649,7 @@ end
 local function effective_style_data(style, value)
   local source = style and STYLE_DATA[style] or nil
   local data = source and copy_style_data(source)
-    or { bold=false, italic=false, wrap_text=false }
+    or { bold=false, italic=false, strike=false, wrap_text=false }
   if getmetatable(value) == DATE_MT and not data.number_format then
     data.number_format = value.kind == "datetime"
       and NUMBER_FORMAT_ALIASES.datetime or NUMBER_FORMAT_ALIASES.date
@@ -474,8 +674,12 @@ local function build_styles_xml(reg)
     b[#b + 1] = '<font>'
     if font.bold then b[#b + 1] = '<b/>' end
     if font.italic then b[#b + 1] = '<i/>' end
+    if font.underline == "single" then b[#b + 1] = '<u/>' end
+    if font.underline == "double" then b[#b + 1] = '<u val="double"/>' end
+    if font.strike then b[#b + 1] = '<strike/>' end
     if font.color then b[#b + 1] = '<color rgb="' .. font.color .. '"/>' end
-    b[#b + 1] = '<sz val="11"/><name val="Calibri"/></font>'
+    b[#b + 1] = '<sz val="' .. num2str(font.size) .. '"/><name val="' ..
+      esc_xml(font.name, "nom de police", 0) .. '"/></font>'
   end
   b[#b + 1] = '</fonts>'
   b[#b + 1] = '<fills count="' .. #reg.fills .. '">'
@@ -490,17 +694,33 @@ local function build_styles_xml(reg)
     end
   end
   b[#b + 1] = '</fills>'
-  b[#b + 1] = '<borders count="1"><border/></borders>'
+  b[#b + 1] = '<borders count="' .. #reg.borders .. '">'
+  for _, border in ipairs(reg.borders) do
+    b[#b + 1] = '<border>'
+    for _, side in ipairs({ "left", "right", "top", "bottom" }) do
+      local item = border[side]
+      if item then
+        b[#b + 1] = '<' .. side .. ' style="' .. item.style .. '">'
+        if item.color then b[#b + 1] = '<color rgb="' .. item.color .. '"/>' end
+        b[#b + 1] = '</' .. side .. '>'
+      else
+        b[#b + 1] = '<' .. side .. '/>'
+      end
+    end
+    b[#b + 1] = '<diagonal/></border>'
+  end
+  b[#b + 1] = '</borders>'
   b[#b + 1] = '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
   b[#b + 1] = '<cellXfs count="' .. #reg.xfs .. '">'
   for _, xf in ipairs(reg.xfs) do
     local attrs = {
       'numFmtId="' .. xf.numFmtId .. '"', 'fontId="' .. xf.fontId .. '"',
-      'fillId="' .. xf.fillId .. '"', 'borderId="0"', 'xfId="0"',
+      'fillId="' .. xf.fillId .. '"', 'borderId="' .. xf.borderId .. '"', 'xfId="0"',
     }
     if xf.numFmtId ~= 0 then attrs[#attrs + 1] = 'applyNumberFormat="1"' end
     if xf.fontId ~= 0 then attrs[#attrs + 1] = 'applyFont="1"' end
     if xf.fillId ~= 0 then attrs[#attrs + 1] = 'applyFill="1"' end
+    if xf.borderId ~= 0 then attrs[#attrs + 1] = 'applyBorder="1"' end
     local has_alignment = xf.horizontal or xf.vertical or xf.wrap_text
     if has_alignment then attrs[#attrs + 1] = 'applyAlignment="1"' end
     if has_alignment then
@@ -525,22 +745,6 @@ end
 local Sheet = {}
 Sheet.__index = Sheet
 
-local function new_sheet(name, workbook)
-  return setmetatable({
-    name   = name,
-    cells  = {},   -- cells[row][col] = valeur Lua brute
-    styles = {},   -- styles[row][col] = objet xlsx.style
-    row_heights = {},
-    column_widths = {},
-    maxrow = -1,
-    maxcol = -1,
-    _workbook = workbook,
-    _freeze_rows = 0,
-    _freeze_cols = 0,
-    _auto_filter = false,
-  }, Sheet)
-end
-
 local MAX_ROW = 1048575
 local MAX_COL = 16383
 local function check_index(v, what, level)
@@ -557,19 +761,79 @@ local function check_finite_number(value, what, min, max, level)
   end
 end
 
+local function col_number(letters)
+  local n = 0
+  letters = letters:gsub("%$", ""):upper()
+  if letters == "" then return nil end
+  for i = 1, #letters do
+    local byte = letters:byte(i)
+    if byte < 65 or byte > 90 then return nil end
+    n = n * 26 + byte - 64
+  end
+  return n - 1
+end
+
+local function parse_a1_range(ref, what, allow_single, level)
+  if type(ref) ~= "string" then error("xlsx: " .. what .. " doit être une string A1:B2", level or 3) end
+  local c1, r1, c2, r2 = ref:match("^%$?([A-Za-z]+)%$?(%d+):%$?([A-Za-z]+)%$?(%d+)$")
+  if not c1 and allow_single then
+    c1, r1 = ref:match("^%$?([A-Za-z]+)%$?(%d+)$")
+    c2, r2 = c1, r1
+  end
+  if not c1 then error("xlsx: " .. what .. " invalide : " .. ref, level or 3) end
+  local a, b = col_number(c1), col_number(c2)
+  local x, y = tonumber(r1) - 1, tonumber(r2) - 1
+  if not a or not b or a < 0 or b > MAX_COL or x < 0 or y > MAX_ROW or a > b or x > y then
+    error("xlsx: " .. what .. " hors limites ou inversée : " .. ref, level or 3)
+  end
+  return x, a, y, b, col_ref(a) .. (x + 1) .. ":" .. col_ref(b) .. (y + 1)
+end
+
 local function ensure_cell_extent(sheet, row, col)
   if row > sheet.maxrow then sheet.maxrow = row end
   if col > sheet.maxcol then sheet.maxcol = col end
 end
 
+local function new_sheet(name, workbook)
+  return setmetatable({
+    name   = name,
+    cells  = {},
+    styles = {},
+    hyperlinks = {},
+    row_heights = {},
+    column_widths = {},
+    merged_ranges = {},
+    maxrow = -1,
+    maxcol = -1,
+    _workbook = workbook,
+    _freeze_rows = 0,
+    _freeze_cols = 0,
+    _auto_filter = false,
+  }, Sheet)
+end
+
+local function set_hyperlink_data(sheet, row, col, data)
+  local rr = sheet.hyperlinks[row]
+  if not rr then rr = {}; sheet.hyperlinks[row] = rr end
+  rr[col] = { target=data.target, internal=data.internal, tooltip=data.tooltip }
+  ensure_cell_extent(sheet, row, col)
+end
+
 --- Écrit une cellule. row/col sont 0-indexés.
---- value : string|number|boolean|date|formula|nil. style est facultatif.
+--- value : string|number|boolean|date|formula|hyperlink|nil. style est facultatif.
 function Sheet:write(row, col, value, style)
   check_index(row, "row", 3)
   check_index(col, "col", 3)
   require_style(style, 3)
   local t = type(value)
   local mt = t == "table" and getmetatable(value) or nil
+  if mt == HYPERLINK_MT then
+    local link = HYPERLINK_DATA[value]
+    value = link.text
+    t = "string"
+    mt = nil
+    set_hyperlink_data(self, row, col, link)
+  end
   if mt == DATE_MT or mt == FORMULA_MT then
     -- valeur taggée : acceptée telle quelle
   elseif value ~= nil and t ~= "string" and t ~= "number" and t ~= "boolean" then
@@ -608,6 +872,24 @@ function Sheet:set_style(row, col, style)
   return self
 end
 
+--- Ajoute ou remplace un hyperlien sur une cellule existante.
+function Sheet:set_hyperlink(row, col, target, opts)
+  check_index(row, "row", 3)
+  check_index(col, "col", 3)
+  local data = normalize_hyperlink(target, target, opts, 3)
+  set_hyperlink_data(self, row, col, data)
+  return self
+end
+
+--- Supprime l'hyperlien d'une cellule sans modifier sa valeur.
+function Sheet:remove_hyperlink(row, col)
+  check_index(row, "row", 3)
+  check_index(col, "col", 3)
+  local rr = self.hyperlinks[row]
+  if rr then rr[col] = nil end
+  return self
+end
+
 --- Définit la largeur d'une colonne 0-indexée, en unités Excel.
 function Sheet:set_column_width(col, width)
   check_index(col, "col", 3)
@@ -639,25 +921,8 @@ function Sheet:freeze_panes(rows, cols)
 end
 
 local function validate_filter_ref(ref)
-  if type(ref) ~= "string" then error("xlsx: la plage de filtre doit être une string A1:B2", 3) end
-  local c1, r1, c2, r2 = ref:match("^([A-Za-z]+)(%d+):([A-Za-z]+)(%d+)$")
-  if not c1 then error("xlsx: plage de filtre invalide : " .. ref, 3) end
-  -- Validation locale : le parseur de références de lecture est défini plus bas.
-  local function col_number(letters)
-    local n = 0
-    for i = 1, #letters do
-      local byte = letters:upper():byte(i)
-      if byte < 65 or byte > 90 then return nil end
-      n = n * 26 + byte - 64
-    end
-    return n - 1
-  end
-  local a, b = col_number(c1), col_number(c2)
-  local x, y = tonumber(r1), tonumber(r2)
-  if not a or not b or a < 0 or b > MAX_COL or x < 1 or y > MAX_ROW + 1 or a > b or x > y then
-    error("xlsx: plage de filtre hors limites ou inversée : " .. ref, 3)
-  end
-  return c1:upper() .. x .. ":" .. c2:upper() .. y
+  local _, _, _, _, normalized = parse_a1_range(ref, "plage de filtre", false, 3)
+  return normalized
 end
 
 --- Active un filtre automatique. Sans plage, utilise la zone de données courante.
@@ -673,19 +938,70 @@ function Sheet:set_auto_filter(ref)
   return self
 end
 
+local function ranges_overlap(a, b)
+  return not (a.r2 < b.r1 or b.r2 < a.r1 or a.c2 < b.c1 or b.c2 < a.c1)
+end
+
+--- Fusionne une plage. Accepte "A1:D1" ou quatre coordonnées 0-indexées.
+function Sheet:merge_cells(a, b, c, d)
+  local r1, c1, r2, c2, ref
+  if type(a) == "string" and b == nil then
+    r1, c1, r2, c2, ref = parse_a1_range(a, "plage fusionnée", false, 3)
+  else
+    if a == nil or b == nil or c == nil or d == nil then
+      error("xlsx: merge_cells attend une plage ou quatre coordonnées", 2)
+    end
+    check_index(a, "row", 3); check_index(b, "col", 3)
+    check_index(c, "row", 3); check_index(d, "col", 3)
+    if a > c or b > d then error("xlsx: plage fusionnée inversée", 2) end
+    r1, c1, r2, c2 = a, b, c, d
+    ref = col_ref(c1) .. (r1 + 1) .. ":" .. col_ref(c2) .. (r2 + 1)
+  end
+  if r1 == r2 and c1 == c2 then error("xlsx: une fusion doit couvrir au moins deux cellules", 2) end
+  local candidate = { r1=r1, c1=c1, r2=r2, c2=c2, ref=ref }
+  for _, current in ipairs(self.merged_ranges) do
+    if ranges_overlap(candidate, current) then
+      error("xlsx: la fusion " .. ref .. " chevauche " .. current.ref, 2)
+    end
+  end
+  self.merged_ranges[#self.merged_ranges + 1] = candidate
+  table.sort(self.merged_ranges, function(x, y)
+    return x.r1 ~= y.r1 and x.r1 < y.r1 or (x.c1 ~= y.c1 and x.c1 < y.c1 or x.ref < y.ref)
+  end)
+  for row = r1, r2 do
+    for col = c1, c2 do
+      if row ~= r1 or col ~= c1 then
+        if self.cells[row] then self.cells[row][col] = nil end
+        if self.styles[row] then self.styles[row][col] = nil end
+        if self.hyperlinks[row] then self.hyperlinks[row][col] = nil end
+      end
+    end
+  end
+  ensure_cell_extent(self, r2, c2)
+  return self
+end
+
+--- Retire une fusion exacte. Les anciennes valeurs des cellules ne sont pas restaurées.
+function Sheet:unmerge_cells(ref)
+  local _, _, _, _, normalized = parse_a1_range(ref, "plage fusionnée", false, 3)
+  for i, current in ipairs(self.merged_ranges) do
+    if current.ref == normalized then
+      table.remove(self.merged_ranges, i)
+      return self
+    end
+  end
+  error("xlsx: fusion introuvable : " .. normalized, 2)
+end
+
 --- Ajoute une ligne complète à la suite. Un style facultatif s'applique aux valeurs présentes.
 function Sheet:append_row(values, style)
-  if type(values) ~= "table" then
-    error("xlsx: append_row attend une table", 2)
-  end
+  if type(values) ~= "table" then error("xlsx: append_row attend une table", 2) end
   require_style(style, 3)
   local row = self.maxrow + 1
-  local n = #values
-  for i = 1, n do
+  for i = 1, #values do
     local v = values[i]
     if v ~= nil then self:write(row, i - 1, v, style) end
   end
-  -- garantir que la ligne existe même si entièrement vide
   if not self.cells[row] then self.cells[row] = {} end
   if row > self.maxrow then self.maxrow = row end
   return self
@@ -693,13 +1009,9 @@ end
 
 --- Écrit une matrice. Un style facultatif s'applique à toutes les valeurs présentes.
 function Sheet:write_rows(matrix, style)
-  if type(matrix) ~= "table" then
-    error("xlsx: write_rows attend une table de lignes", 2)
-  end
+  if type(matrix) ~= "table" then error("xlsx: write_rows attend une table de lignes", 2) end
   require_style(style, 3)
-  for i = 1, #matrix do
-    self:append_row(matrix[i], style)
-  end
+  for i = 1, #matrix do self:append_row(matrix[i], style) end
   return self
 end
 
@@ -713,19 +1025,42 @@ local function freeze_pane_xml(rows, cols)
   if cols > 0 then attrs[#attrs + 1] = 'xSplit="' .. cols .. '"' end
   if rows > 0 then attrs[#attrs + 1] = 'ySplit="' .. rows .. '"' end
   attrs[#attrs + 1] = 'topLeftCell="' .. col_ref(cols) .. (rows + 1) .. '"'
-  local pane = rows > 0 and cols > 0 and "bottomRight"
-    or (rows > 0 and "bottomLeft" or "topRight")
+  local pane = rows > 0 and cols > 0 and "bottomRight" or (rows > 0 and "bottomLeft" or "topRight")
   attrs[#attrs + 1] = 'activePane="' .. pane .. '"'
   attrs[#attrs + 1] = 'state="frozen"'
   return '<sheetViews><sheetView workbookViewId="0"><pane ' ..
     table.concat(attrs, " ") .. '/></sheetView></sheetViews>'
 end
 
--- sérialise la feuille en XML ; alimente sst (liste) et sst_index (map)
+local function cached_formula_xml(data)
+  local value = data.cached_value
+  if value == nil then return "", "" end
+  local t = type(value)
+  if t == "string" then return ' t="str"', '<v>' .. esc_xml(value, "valeur de formule", 0) .. '</v>' end
+  if t == "boolean" then return ' t="b"', '<v>' .. (value and "1" or "0") .. '</v>' end
+  return "", '<v>' .. num2str(value) .. '</v>'
+end
+
+local function worksheet_relationships_xml(rels)
+  if #rels == 0 then return nil end
+  local b = {
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+  }
+  for _, rel in ipairs(rels) do
+    b[#b + 1] = '<Relationship Id="' .. rel.id ..
+      '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="' ..
+      esc_xml(rel.target, "cible d'hyperlien", 0) .. '" TargetMode="External"/>'
+  end
+  b[#b + 1] = '</Relationships>'
+  return table.concat(b)
+end
+
+-- sérialise la feuille en XML ; alimente sst et renvoie aussi ses relations.
 function Sheet:_xml(sst, sst_index)
   local b = {}
   b[#b + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-  b[#b + 1] = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+  b[#b + 1] = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
   if self.maxrow >= 0 and self.maxcol >= 0 then
     b[#b + 1] = '<dimension ref="A1:' .. col_ref(self.maxcol) .. (self.maxrow + 1) .. '"/>'
   end
@@ -744,8 +1079,7 @@ function Sheet:_xml(sst, sst_index)
   end
   b[#b + 1] = '<sheetData>'
   for r = 0, self.maxrow do
-    local rowcells = self.cells[r]
-    local rowstyles = self.styles[r]
+    local rowcells, rowstyles = self.cells[r], self.styles[r]
     if rowcells or rowstyles or self.row_heights[r] then
       local rowattrs = { 'r="' .. (r + 1) .. '"' }
       if self.row_heights[r] then
@@ -766,19 +1100,24 @@ function Sheet:_xml(sst, sst_index)
           if mt == DATE_MT then
             local date1904 = self._workbook and self._workbook._date1904 or false
             local serial = ymd_to_serial(v.y, v.m, v.d, v.h, v.mi, v.s, date1904)
-            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. '><v>' ..
-              num2str(serial) .. '</v></c>'
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. '><v>' .. num2str(serial) .. '</v></c>'
           elseif mt == FORMULA_MT then
-            local formula = FORMULA_DATA[v].expression
-            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. '><f>' ..
-              esc_xml(formula, "formule", 0) .. '</f></c>'
+            local formula = FORMULA_DATA[v]
+            if not formula.expression or formula.expression == "" then
+              error("xlsx: impossible d'écrire une formule partagée sans expression résolue", 0)
+            end
+            local tattr, cached = cached_formula_xml(formula)
+            local fattrs = ""
+            if formula.formula_type and formula.formula_type ~= "normal" then
+              fattrs = ' t="' .. formula.formula_type .. '"'
+              if formula.ref then fattrs = fattrs .. ' ref="' .. esc_xml(formula.ref, "référence de formule", 0) .. '"' end
+              if formula.shared_index ~= nil then fattrs = fattrs .. ' si="' .. formula.shared_index .. '"' end
+            end
+            b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. tattr .. '><f' .. fattrs .. '>' ..
+              esc_xml(formula.expression, "formule", 0) .. '</f>' .. cached .. '</c>'
           elseif tv == "string" then
             local idx = sst_index[v]
-            if idx == nil then
-              idx = #sst
-              sst[#sst + 1] = v
-              sst_index[v] = idx
-            end
+            if idx == nil then idx = #sst; sst[#sst + 1] = v; sst_index[v] = idx end
             b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. ' t="s"><v>' .. idx .. '</v></c>'
           elseif tv == "boolean" then
             b[#b + 1] = '<c r="' .. ref .. '"' .. sattr .. ' t="b"><v>' .. (v and "1" or "0") .. '</v></c>'
@@ -800,8 +1139,37 @@ function Sheet:_xml(sst, sst_index)
     filter_ref = self._auto_filter
   end
   if filter_ref then b[#b + 1] = '<autoFilter ref="' .. filter_ref .. '"/>' end
+  if #self.merged_ranges > 0 then
+    b[#b + 1] = '<mergeCells count="' .. #self.merged_ranges .. '">'
+    for _, range in ipairs(self.merged_ranges) do b[#b + 1] = '<mergeCell ref="' .. range.ref .. '"/>' end
+    b[#b + 1] = '</mergeCells>'
+  end
+
+  local rels, links = {}, {}
+  local rows = {}
+  for row in pairs(self.hyperlinks) do rows[#rows + 1] = row end
+  table.sort(rows)
+  for _, row in ipairs(rows) do
+    local cols = {}
+    for col in pairs(self.hyperlinks[row]) do cols[#cols + 1] = col end
+    table.sort(cols)
+    for _, col in ipairs(cols) do
+      local link = self.hyperlinks[row][col]
+      local attrs = { 'ref="' .. col_ref(col) .. (row + 1) .. '"' }
+      if link.tooltip then attrs[#attrs + 1] = 'tooltip="' .. esc_xml(link.tooltip, "infobulle", 0) .. '"' end
+      if link.internal then
+        attrs[#attrs + 1] = 'location="' .. esc_xml(link.target, "cible interne", 0) .. '"'
+      else
+        local id = "rId" .. (#rels + 1)
+        rels[#rels + 1] = { id=id, target=link.target }
+        attrs[#attrs + 1] = 'r:id="' .. id .. '"'
+      end
+      links[#links + 1] = '<hyperlink ' .. table.concat(attrs, " ") .. '/>'
+    end
+  end
+  if #links > 0 then b[#b + 1] = '<hyperlinks>' .. table.concat(links) .. '</hyperlinks>' end
   b[#b + 1] = '</worksheet>'
-  return table.concat(b)
+  return table.concat(b), worksheet_relationships_xml(rels)
 end
 
 -- ----------------------------------------------------------------------------
@@ -856,15 +1224,14 @@ function Workbook:_parts()
   local nsheets = #self.sheets
   self._style_registry = new_style_registry()
   local sst, sst_index = {}, {}
-  local sheet_xmls = {}
+  local sheet_xmls, sheet_rels = {}, {}
   for i = 1, nsheets do
-    sheet_xmls[i] = self.sheets[i]:_xml(sst, sst_index)
+    sheet_xmls[i], sheet_rels[i] = self.sheets[i]:_xml(sst, sst_index)
   end
 
   local parts = {}
   local function add(name, data) parts[#parts + 1] = { name = name, data = data } end
 
-  -- [Content_Types].xml
   do
     local t = {}
     t[#t + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -882,7 +1249,6 @@ function Workbook:_parts()
     add("[Content_Types].xml", table.concat(t))
   end
 
-  -- _rels/.rels
   add("_rels/.rels", table.concat({
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
@@ -890,7 +1256,6 @@ function Workbook:_parts()
     '</Relationships>',
   }))
 
-  -- xl/workbook.xml
   do
     local t = {}
     t[#t + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -905,15 +1270,13 @@ function Workbook:_parts()
     add("xl/workbook.xml", table.concat(t))
   end
 
-  -- xl/_rels/workbook.xml.rels  (sheets rId1..N, sharedStrings rId(N+1))
   do
     local t = {}
     t[#t + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     t[#t + 1] = '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     for i = 1, nsheets do
       t[#t + 1] = '<Relationship Id="rId' .. i ..
-        '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' ..
-        i .. '.xml"/>'
+        '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' .. i .. '.xml"/>'
     end
     t[#t + 1] = '<Relationship Id="rId' .. (nsheets + 1) ..
       '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>'
@@ -923,12 +1286,11 @@ function Workbook:_parts()
     add("xl/_rels/workbook.xml.rels", table.concat(t))
   end
 
-  -- xl/worksheets/sheetN.xml
   for i = 1, nsheets do
     add("xl/worksheets/sheet" .. i .. ".xml", sheet_xmls[i])
+    if sheet_rels[i] then add("xl/worksheets/_rels/sheet" .. i .. ".xml.rels", sheet_rels[i]) end
   end
 
-  -- xl/sharedStrings.xml
   do
     local t = {}
     t[#t + 1] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -941,10 +1303,8 @@ function Workbook:_parts()
     add("xl/sharedStrings.xml", table.concat(t))
   end
 
-  -- xl/styles.xml : styles dynamiques, dates incluses
   add("xl/styles.xml", build_styles_xml(self._style_registry))
   self._style_registry = nil
-
   return parts
 end
 
@@ -1080,10 +1440,9 @@ end
 -- ============================================================================
 -- LECTURE
 -- ============================================================================
--- Lecture : valeurs (string / number / boolean), dates via styles, sharedStrings,
--- inlineStr, plusieurs feuilles et cellules éparses. Les expressions de formule
--- et les réglages de présentation ne sont pas encore exposés ; seule une valeur
--- de formule mise en cache peut être lue.
+-- Lecture : valeurs, dates, formules, styles, dimensions, fusions, volets,
+-- filtres et hyperliens. read() conserve son contrat historique et renvoie la
+-- valeur mise en cache ; get_formula() expose séparément l'expression.
 
 -- ----------------------------------------------------------------------------
 -- INFLATE (RFC 1951) — décompression DEFLATE brute, en Lua pur
@@ -1467,35 +1826,79 @@ local function decode_cell(inner, ty, shared)
     return raw and unescape(raw) or nil
   else
     local raw = inner:match("<v>(.-)</v>")
-    if not raw then return nil end
+    if raw == nil or raw == "" then return nil end
     local value = tonumber(raw)
     if value == nil then error("xlsx: valeur numérique invalide : " .. raw, 0) end
     return value
   end
 end
 
--- analyse styles.xml -> map index_de_style(0-based) -> "date" | "datetime"
+-- analyse styles.xml -> styles pris en charge et classification date/datetime
 local BUILTIN_DATE = {
   [14] = "date", [15] = "date", [16] = "date", [17] = "date",
   [18] = "datetime", [19] = "datetime", [20] = "datetime", [21] = "datetime",
   [22] = "datetime", [45] = "datetime", [46] = "datetime", [47] = "datetime",
 }
+local BUILTIN_NUMFMT = {
+  [0]="General", [1]="0", [2]="0.00", [3]="#,##0", [4]="#,##0.00",
+  [9]="0%", [10]="0.00%", [11]="0.00E+00", [12]="# ?/?", [13]="# ??/??",
+  [14]="mm-dd-yy", [15]="d-mmm-yy", [16]="d-mmm", [17]="mmm-yy",
+  [18]="h:mm AM/PM", [19]="h:mm:ss AM/PM", [20]="h:mm", [21]="h:mm:ss",
+  [22]="m/d/yy h:mm", [45]="mm:ss", [46]="[h]:mm:ss", [47]="mmss.0",
+  [49]="@",
+}
+
+local function xml_attr(attrs, name)
+  return attrs and unescape(attrs:match(name .. '="([^"]*)"')) or nil
+end
+
+local function parse_repeated_elements(section, name)
+  local out, p = {}, 1
+  while true do
+    local a, b = section:find("<" .. name .. "[%s>/]", p)
+    if not a then break end
+    local tagend = assert(section:find(">", b))
+    local tag = section:sub(a, tagend)
+    if tag:sub(-2) == "/>" then
+      out[#out + 1] = { attrs=tag:match("^<" .. name .. "%s*(.-)/>$") or "", body="" }
+      p = tagend + 1
+    else
+      local close_a, close_b = section:find("</" .. name .. ">", tagend + 1, true)
+      if not close_a then error("xlsx: élément XML non fermé : " .. name, 0) end
+      out[#out + 1] = {
+        attrs=tag:match("^<" .. name .. "%s*(.-)>$") or "",
+        body=section:sub(tagend + 1, close_a - 1),
+      }
+      p = close_b + 1
+    end
+  end
+  return out
+end
+
+local function parse_border_side(body, side)
+  local attrs, inner = body:match("<" .. side .. "%s*(.-)>(.-)</" .. side .. ">")
+  if not attrs then attrs = body:match("<" .. side .. "%s*(.-)/>"); inner = "" end
+  if attrs == nil then return nil end
+  local style = xml_attr(attrs, "style")
+  if not style or not BORDER_STYLES[style] then return nil end
+  local color = inner:match('<color[^>]-rgb="([%x]+)"')
+  return { style=style, color=color and normalize_color(color, "couleur de bordure", 0) or nil }
+end
+
 local function parse_styles(xml)
-  local datestyle = {}
-  if not xml then return datestyle end
-  -- formats personnalisés (numFmtId >= 164)
+  local datestyle, style_objects = {}, { [0] = false }
+  if not xml then return datestyle, style_objects end
   local fmtcode = {}
   for tag in xml:gmatch("<numFmt%s.-/>") do
-    local id = tag:match('numFmtId="(%d+)"')
+    local id = tonumber(tag:match('numFmtId="(%d+)"'))
     local code = tag:match('formatCode="([^"]*)"')
-    if id and code then fmtcode[tonumber(id)] = unescape(code) end
+    if id and code then fmtcode[id] = unescape(code) end
   end
   local function classify(id)
-    local b = BUILTIN_DATE[id]
-    if b then return b end
+    local builtin = BUILTIN_DATE[id]
+    if builtin then return builtin end
     local code = fmtcode[id]
     if not code then return nil end
-    -- retire littéraux entre guillemets, sections [..] et échappements
     local c = code:gsub('"[^"]*"', ""):gsub("%[[^%]]*%]", ""):gsub("\\.", ""):lower()
     local has_date = c:find("[yd]") or c:find("mmm")
     local has_time = c:find("[hs]")
@@ -1503,61 +1906,194 @@ local function parse_styles(xml)
     if has_date then return "date" end
     return nil
   end
-  -- cellXfs : un xf par index, dans l'ordre
-  local cellxfs = xml:match("<cellXfs[^>]*>(.-)</cellXfs>")
-  if cellxfs then
-    local idx = 0
-    for tag in cellxfs:gmatch("<xf%s[^>]*>") do
-      local cls = classify(tonumber(tag:match('numFmtId="(%d+)"') or "0"))
-      if cls then datestyle[idx] = cls end
-      idx = idx + 1
-    end
+
+  local fonts, fills, borders = {}, {}, {}
+  local font_section = xml:match("<fonts[^>]*>(.-)</fonts>") or ""
+  for i, element in ipairs(parse_repeated_elements(font_section, "font")) do
+    local body = element.body
+    local uattrs = body:match("<u%s*(.-)/>")
+    local underline
+    if uattrs ~= nil then underline = xml_attr(uattrs, "val") == "double" and "double" or "single" end
+    local color = body:match('<color[^>]-rgb="([%x]+)"')
+    fonts[i - 1] = {
+      bold=body:find("<b[%s/]", 1) ~= nil,
+      italic=body:find("<i[%s/]", 1) ~= nil,
+      underline=underline,
+      strike=body:find("<strike[%s/]", 1) ~= nil,
+      font_name=unescape(body:match('<name[^>]-val="([^"]*)"') or "Calibri"),
+      font_size=tonumber(body:match('<sz[^>]-val="([^"]*)"') or "11"),
+      font_color=color and normalize_color(color, "couleur de police", 0) or nil,
+    }
   end
-  return datestyle
+  local fill_section = xml:match("<fills[^>]*>(.-)</fills>") or ""
+  for i, element in ipairs(parse_repeated_elements(fill_section, "fill")) do
+    local body = element.body
+    local color = body:match('<fgColor[^>]-rgb="([%x]+)"')
+    fills[i - 1] = color and normalize_color(color, "couleur de fond", 0) or nil
+  end
+  local border_section = xml:match("<borders[^>]*>(.-)</borders>") or ""
+  for i, element in ipairs(parse_repeated_elements(border_section, "border")) do
+    local border = {}
+    for _, side in ipairs({ "left", "right", "top", "bottom" }) do
+      border[side] = parse_border_side(element.body, side)
+    end
+    borders[i - 1] = next(border) and border or nil
+  end
+
+  local cellxfs = xml:match("<cellXfs[^>]*>(.-)</cellXfs>") or ""
+  for idx, element in ipairs(parse_repeated_elements(cellxfs, "xf")) do
+    local attrs, body = element.attrs, element.body
+    local numFmtId = tonumber(xml_attr(attrs, "numFmtId") or "0")
+    local font = fonts[tonumber(xml_attr(attrs, "fontId") or "0")] or {}
+    local fill = fills[tonumber(xml_attr(attrs, "fillId") or "0")]
+    local border = borders[tonumber(xml_attr(attrs, "borderId") or "0")]
+    local alignment_attrs = body:match("<alignment%s*(.-)/>") or body:match("<alignment%s*(.-)>")
+    local data = {
+      bold=font.bold == true, italic=font.italic == true, underline=font.underline,
+      strike=font.strike == true, font_name=font.font_name, font_size=font.font_size,
+      font_color=font.font_color, fill_color=fill,
+      horizontal=xml_attr(alignment_attrs, "horizontal"),
+      vertical=xml_attr(alignment_attrs, "vertical"),
+      wrap_text=xml_attr(alignment_attrs, "wrapText") == "1" or xml_attr(alignment_attrs, "wrapText") == "true",
+      number_format=fmtcode[numFmtId] or (numFmtId ~= 0 and BUILTIN_NUMFMT[numFmtId] or nil),
+      border=copy_border(border),
+    }
+    local style_index = idx - 1
+    if classify(numFmtId) then datestyle[style_index] = classify(numFmtId) end
+    local is_default = style_index == 0 or (not data.bold and not data.italic and not data.underline and
+      not data.strike and (not data.font_name or data.font_name == "Calibri") and
+      (not data.font_size or data.font_size == 11) and not data.font_color and not data.fill_color and
+      not data.horizontal and not data.vertical and not data.wrap_text and not data.number_format and not data.border)
+    style_objects[style_index] = is_default and false or style_object_from_data(data)
+  end
+  return datestyle, style_objects
 end
 
-local function parse_sheet(xml, shared, datestyle, date1904)
-  local cells = {}
+local function parse_relationships(xml)
+  local result = {}
+  if not xml then return result end
+  for tag in xml:gmatch("<Relationship%s.-/>") do
+    local id = tag:match('Id="([^"]*)"')
+    if id then
+      result[id] = {
+        target=unescape(tag:match('Target="([^"]*)"') or ""),
+        target_mode=tag:match('TargetMode="([^"]*)"'),
+        rel_type=tag:match('Type="([^"]*)"'),
+      }
+    end
+  end
+  return result
+end
+
+local function parse_sheet(xml, shared, datestyle, style_objects, date1904, relationships)
+  local cells, formulas, styles = {}, {}, {}
+  local row_heights, column_widths = {}, {}
   local maxrow, maxcol = -1, -1
+
+  for tag in xml:gmatch("<col%s.-/>") do
+    local first, last = tonumber(tag:match('min="(%d+)"')), tonumber(tag:match('max="(%d+)"'))
+    local width = tonumber(tag:match('width="([^"]+)"'))
+    if first and last and width and first >= 1 and last <= MAX_COL + 1 and first <= last then
+      for col = first - 1, last - 1 do column_widths[col] = width end
+    end
+  end
+
   for crow in xml:gmatch("<row[%s>].-</row>") do
+    local rowtag = crow:match("^(<row[^>]*>)") or ""
+    local rownum = tonumber(rowtag:match('r="(%d+)"'))
+    local height = tonumber(rowtag:match('ht="([^"]+)"'))
+    if rownum and height and rownum >= 1 and rownum <= MAX_ROW + 1 then row_heights[rownum - 1] = height end
     local p = 1
     while true do
       local cs = crow:find("<c[%s/>]", p)
       if not cs then break end
-      local tagend = crow:find(">", cs)
+      local tagend = assert(crow:find(">", cs))
       local tag = crow:sub(cs, tagend)
       local selfclose = tag:sub(-2) == "/>"
       local ref = tag:match('r="([^"]*)"')
       local ty = tag:match('t="([^"]*)"')
-      local st = tag:match('s="(%d+)"')
-      local value, nextp
-      if selfclose then
-        value, nextp = nil, tagend + 1
+      local st = tonumber(tag:match('s="(%d+)"'))
+      local inner, nextp
+      if selfclose then inner, nextp = "", tagend + 1
       else
         local close = crow:find("</c>", tagend, true)
-        local inner = crow:sub(tagend + 1, close - 1)
-        value = decode_cell(inner, ty, shared)
-        nextp = close + 4
+        if not close then error("xlsx: cellule XML non fermée", 0) end
+        inner, nextp = crow:sub(tagend + 1, close - 1), close + 4
       end
-      -- conversion date : cellule numérique portant un style de date
-      if type(value) == "number" and st and datestyle then
-        local cls = datestyle[tonumber(st)]
-        if cls then value = serial_to_iso(value, cls == "datetime", date1904) end
-      end
-      if ref and value ~= nil then
+      if ref then
         local r0, c0 = ref_to_rowcol(ref)
         if r0 then
-          local row = cells[r0]
-          if not row then row = {}; cells[r0] = row end
-          row[c0] = value
           if r0 > maxrow then maxrow = r0 end
           if c0 > maxcol then maxcol = c0 end
+          if st and st ~= 0 then
+            local sr = styles[r0]; if not sr then sr = {}; styles[r0] = sr end
+            sr[c0] = style_objects[st] or false
+          end
+          local raw_value = decode_cell(inner, ty, shared)
+          local display_value = raw_value
+          if type(display_value) == "number" and st then
+            local cls = datestyle[st]
+            if cls then display_value = serial_to_iso(display_value, cls == "datetime", date1904) end
+          end
+          local fattrs, fexpr = inner:match("<f%s*(.-)>(.-)</f>")
+          if not fattrs then fattrs = inner:match("<f%s*(.-)/>") end
+          if fattrs ~= nil then
+            local ftype = xml_attr(fattrs, "t") or "normal"
+            local expression = fexpr and unescape(fexpr) or nil
+            local formula = new_formula({
+              expression=expression, cached_value=raw_value, formula_type=ftype,
+              ref=xml_attr(fattrs, "ref"), shared_index=tonumber(xml_attr(fattrs, "si")),
+            })
+            local fr = formulas[r0]; if not fr then fr = {}; formulas[r0] = fr end
+            fr[c0] = formula
+          end
+          if display_value ~= nil then
+            local row = cells[r0]; if not row then row = {}; cells[r0] = row end
+            row[c0] = display_value
+          end
         end
       end
       p = nextp
     end
   end
-  return cells, maxrow, maxcol
+
+  local freeze_rows, freeze_cols = 0, 0
+  local pane = xml:match("<pane%s.-/>")
+  if pane and (pane:match('state="([^"]+)"') == "frozen" or pane:match('state="([^"]+)"') == "frozenSplit") then
+    freeze_cols = tonumber(pane:match('xSplit="([^"]+)"')) or 0
+    freeze_rows = tonumber(pane:match('ySplit="([^"]+)"')) or 0
+    freeze_cols, freeze_rows = math.floor(freeze_cols), math.floor(freeze_rows)
+  end
+  local auto_filter = xml:match('<autoFilter[^>]-ref="([^"]+)"')
+  if auto_filter then auto_filter = unescape(auto_filter) end
+  local merged = {}
+  for tag in xml:gmatch("<mergeCell%s.-/>") do
+    local ref = tag:match('ref="([^"]+)"')
+    if ref then
+      local r1, c1, r2, c2, normalized = parse_a1_range(unescape(ref), "fusion lue", false, 0)
+      merged[#merged + 1] = { ref=normalized, r1=r1, c1=c1, r2=r2, c2=c2 }
+    end
+  end
+  local hyperlink_ranges = {}
+  for tag in xml:gmatch("<hyperlink%s.-/>") do
+    local ref = tag:match('ref="([^"]+)"')
+    if ref then
+      local r1, c1, r2, c2, normalized = parse_a1_range(unescape(ref), "hyperlien lu", true, 0)
+      local rid = tag:match('r:id="([^"]+)"')
+      local location = tag:match('location="([^"]*)"')
+      local relation = rid and relationships[rid] or nil
+      local target = location and unescape(location) or (relation and relation.target or nil)
+      if target then
+        hyperlink_ranges[#hyperlink_ranges + 1] = {
+          ref=normalized, r1=r1, c1=c1, r2=r2, c2=c2, target=target,
+          internal=location ~= nil, tooltip=unescape(tag:match('tooltip="([^"]*)"') or ""),
+        }
+        if hyperlink_ranges[#hyperlink_ranges].tooltip == "" then hyperlink_ranges[#hyperlink_ranges].tooltip = nil end
+      end
+    end
+  end
+  return cells, formulas, styles, maxrow, maxcol, row_heights, column_widths,
+    freeze_rows, freeze_cols, auto_filter, merged, hyperlink_ranges
 end
 
 local function package_path(base, target)
@@ -1578,12 +2114,9 @@ local function package_path(base, target)
 end
 
 local function parse_workbook(wbxml, relsxml)
+  local relationships = parse_relationships(relsxml)
   local rid2target = {}
-  for tag in relsxml:gmatch("<Relationship%s.-/>") do
-    local id = tag:match('Id="([^"]*)"')
-    local target = tag:match('Target="([^"]*)"')
-    if id and target then rid2target[id] = unescape(target) end
-  end
+  for id, rel in pairs(relationships) do rid2target[id] = rel.target end
   local sheets, seen = {}, {}
   for tag in wbxml:gmatch("<sheet%s.-/>") do
     local name = unescape(tag:match('name="([^"]*)"') or "")
@@ -1617,13 +2150,69 @@ end
 local ReadSheet = {}
 ReadSheet.__index = ReadSheet
 
---- Lit une cellule (row, col 0-indexés, comme à l'écriture). nil si vide.
+--- Lit la valeur mise en cache d'une cellule. nil si vide ou sans cache.
 function ReadSheet:read(r, c)
-  check_index(r, "row", 3)
-  check_index(c, "col", 3)
+  check_index(r, "row", 3); check_index(c, "col", 3)
   local row = self.cells[r]
   if not row then return nil end
   return row[c]
+end
+
+--- Renvoie l'objet formule d'une cellule, ou nil.
+function ReadSheet:get_formula(r, c)
+  check_index(r, "row", 3); check_index(c, "col", 3)
+  local row = self.formulas[r]
+  return row and row[c] or nil
+end
+
+--- Renvoie le style pris en charge de la cellule, ou nil pour le style par défaut.
+function ReadSheet:get_style(r, c)
+  check_index(r, "row", 3); check_index(c, "col", 3)
+  local row = self.styles[r]
+  local style = row and row[c] or nil
+  return style == false and nil or style
+end
+
+function ReadSheet:get_column_width(col)
+  check_index(col, "col", 3)
+  return self.column_widths[col]
+end
+
+function ReadSheet:get_row_height(row)
+  check_index(row, "row", 3)
+  return self.row_heights[row]
+end
+
+function ReadSheet:get_frozen_panes()
+  return self.freeze_rows, self.freeze_cols
+end
+
+function ReadSheet:get_auto_filter()
+  return self.auto_filter
+end
+
+function ReadSheet:merged_cells()
+  local out = {}
+  for i, range in ipairs(self.merged_ranges) do out[i] = range.ref end
+  return out
+end
+
+function ReadSheet:get_hyperlink(row, col)
+  check_index(row, "row", 3); check_index(col, "col", 3)
+  for _, link in ipairs(self.hyperlink_ranges) do
+    if row >= link.r1 and row <= link.r2 and col >= link.c1 and col <= link.c2 then
+      return { target=link.target, internal=link.internal, tooltip=link.tooltip, ref=link.ref }
+    end
+  end
+  return nil
+end
+
+function ReadSheet:hyperlinks()
+  local out = {}
+  for i, link in ipairs(self.hyperlink_ranges) do
+    out[i] = { target=link.target, internal=link.internal, tooltip=link.tooltip, ref=link.ref }
+  end
+  return out
 end
 
 --- Renvoie maxrow, maxcol (0-indexés ; -1, -1 si la feuille est vide).
@@ -1631,8 +2220,7 @@ function ReadSheet:dims()
   return self.maxrow, self.maxcol
 end
 
---- Itérateur de lignes. Chaque `row` est un tableau 1-indexé (row[1] = col A),
---- avec row.n = nombre de colonnes. Les cellules vides sont nil.
+--- Itérateur de lignes sur les valeurs mises en cache.
 function ReadSheet:rows()
   local r = -1
   return function()
@@ -1640,9 +2228,7 @@ function ReadSheet:rows()
     if r > self.maxrow then return nil end
     local src = self.cells[r]
     local row = { n = self.maxcol + 1 }
-    if src then
-      for c = 0, self.maxcol do row[c + 1] = src[c] end
-    end
+    if src then for c = 0, self.maxcol do row[c + 1] = src[c] end end
     return row
   end
 end
@@ -1650,30 +2236,29 @@ end
 local ReadWB = {}
 ReadWB.__index = ReadWB
 
---- Système de dates du classeur lu : "1900" ou "1904".
 function ReadWB:date_system()
   return self._date1904 and "1904" or "1900"
 end
 
---- Liste ordonnée des noms de feuilles.
 function ReadWB:sheet_names()
   local t = {}
   for i, sh in ipairs(self._sheets) do t[i] = sh.name end
   return t
 end
 
---- Récupère une feuille par nom (string) ou index 1-based (number).
+local function rels_path_for_part(part)
+  local dir, file = part:match("^(.-)([^/]+)$")
+  if not dir then return "_rels/" .. part .. ".rels" end
+  return dir .. "_rels/" .. file .. ".rels"
+end
+
 function ReadWB:sheet(which)
   local def
   if type(which) == "number" then
-    if math.type(which) ~= "integer" or which < 1 then
-      error("xlsx: l'index de feuille doit être un entier >= 1", 2)
-    end
+    if math.type(which) ~= "integer" or which < 1 then error("xlsx: l'index de feuille doit être un entier >= 1", 2) end
     def = self._sheets[which]
   elseif type(which) == "string" then
-    for _, sh in ipairs(self._sheets) do
-      if sh.name == which then def = sh; break end
-    end
+    for _, sh in ipairs(self._sheets) do if sh.name == which then def = sh; break end end
   else
     error("xlsx: sheet attend un nom (string) ou un index (number)", 2)
   end
@@ -1682,13 +2267,21 @@ function ReadWB:sheet(which)
   if not def.path then return nil, "xlsx: cible de feuille introuvable" end
   local e = self._byname[def.path]
   if not e then return nil, "xlsx: partie manquante : " .. def.path end
-  local ok, cells, maxrow, maxcol = pcall(function()
+  local ok, result = pcall(function()
     local xml = validate_xml_document(zip_extract(self._data, e, self._limits), def.path)
-    return parse_sheet(xml, self._shared, self._datestyle, self._date1904)
+    local rel_entry = self._byname[rels_path_for_part(def.path)]
+    local rel_xml = rel_entry and validate_xml_document(zip_extract(self._data, rel_entry, self._limits), rel_entry.name) or nil
+    local relationships = parse_relationships(rel_xml)
+    return { parse_sheet(xml, self._shared, self._datestyle, self._style_objects, self._date1904, relationships) }
   end)
-  if not ok then return nil, tostring(cells) end
-  local rs = setmetatable(
-    { name = def.name, cells = cells, maxrow = maxrow, maxcol = maxcol }, ReadSheet)
+  if not ok then return nil, tostring(result) end
+  local values = result
+  local rs = setmetatable({
+    name=def.name, cells=values[1], formulas=values[2], styles=values[3],
+    maxrow=values[4], maxcol=values[5], row_heights=values[6], column_widths=values[7],
+    freeze_rows=values[8], freeze_cols=values[9], auto_filter=values[10],
+    merged_ranges=values[11], hyperlink_ranges=values[12],
+  }, ReadSheet)
   self._cache[def] = rs
   return rs
 end
@@ -1806,10 +2399,11 @@ function xlsx.open(path, opts)
     local ssxml = part("xl/sharedStrings.xml")
     local shared = ssxml and parse_shared_strings(ssxml) or {}
     local sheets, date1904 = parse_workbook(wbxml, relsxml)
-    local datestyle = parse_styles(part("xl/styles.xml"))
+    local datestyle, style_objects = parse_styles(part("xl/styles.xml"))
     return setmetatable({
       _data=data, _byname=byname, _shared=shared, _sheets=sheets,
-      _cache={}, _datestyle=datestyle, _date1904=date1904, _limits=limits,
+      _cache={}, _datestyle=datestyle, _style_objects=style_objects,
+      _date1904=date1904, _limits=limits,
     }, ReadWB)
   end)
   if not ok then return nil, tostring(result) end

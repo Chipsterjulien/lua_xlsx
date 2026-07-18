@@ -243,7 +243,7 @@ end
 -- ---- PRÉSENTATION ET FORMULES ----------------------------------------------
 print("\n[7] styles, dimensions, volets, filtres et formules")
 do
-  check(xlsx.VERSION == "1.1.0", "version du module 1.1.0")
+  check(xlsx.VERSION == "1.2.0", "version du module 1.2.0")
   local header = xlsx.style({
     bold = true,
     fill_color = "D9EAF7",
@@ -313,6 +313,99 @@ do
     "nombre de lignes figées invalide refusé")
   expect_error(function() xlsx.new():add_sheet("x"):set_auto_filter("D3:A1") end,
     "plage de filtre inversée refusée")
+end
+
+
+-- ---- STRUCTURE, STYLES ENRICHIS, HYPERLIENS ET LECTURE ---------------------
+print("\n[8] fusions, bordures, polices, hyperliens et lecture de présentation")
+do
+  local rich = xlsx.style({
+    bold = true,
+    italic = true,
+    underline = "double",
+    strike = true,
+    font_name = "Liberation Sans",
+    font_size = 14,
+    font_color = "112233",
+    fill_color = "DDEEFF",
+    horizontal = "center",
+    vertical = "center",
+    border = {
+      left = { style = "thin", color = "FF0000" },
+      right = { style = "double" },
+      top = { style = "dashed", color = "00AA00" },
+      bottom = { style = "dotted" },
+    },
+  })
+  check(xlsx.is_style(rich), "is_style reconnaît un style")
+  local options = xlsx.style_options(rich)
+  options.border.left.style = "thick"
+  check(rich.border.left.style == "thin", "style_options renvoie une copie profonde")
+
+  local wb = xlsx.new()
+  local sh = wb:add_sheet("Présentation 1.2")
+  sh:write(0, 0, "Titre", rich)
+  sh:write(0, 1, "supprimé par la fusion")
+  sh:merge_cells("A1:D1")
+  sh:write(1, 0, xlsx.hyperlink("https://example.com/?a=1&b=2", "Site", {
+    tooltip = "Ouvrir le site",
+  }))
+  sh:write(2, 0, "Aller à la cible")
+  sh:set_hyperlink(2, 0, "'Cible'!A1", { internal = true })
+  sh:write(3, 0, xlsx.formula("SUM(B2:B3)", 19.75), rich)
+  sh:set_column_width(0, 22)
+  sh:set_row_height(0, 30)
+  sh:freeze_panes(1, 2)
+  sh:set_auto_filter("A2:D4")
+  wb:add_sheet("Cible"):write(0, 0, "ici")
+  assert(wb:save(TMP2, { use_babet = false }))
+
+  local read = assert(xlsx.open(TMP2, { use_babet = false }))
+  local rs = assert(read:sheet("Présentation 1.2"))
+  check(rs:read(0, 0) == "Titre" and rs:read(0, 1) == nil,
+    "la fusion conserve seulement la cellule supérieure gauche")
+  check(table.concat(rs:merged_cells(), ",") == "A1:D1", "fusions exposées en lecture")
+
+  local formula = rs:get_formula(3, 0)
+  check(xlsx.is_formula(formula) and formula.expression == "SUM(B2:B3)"
+      and formula.cached_value == 19.75 and rs:read(3, 0) == 19.75,
+    "formule et valeur mise en cache exposées séparément")
+
+  local read_style = rs:get_style(0, 0)
+  check(read_style and read_style.font_name == "Liberation Sans"
+      and read_style.font_size == 14 and read_style.underline == "double"
+      and read_style.strike == true, "police enrichie relue")
+  check(read_style and read_style.border.left.style == "thin"
+      and read_style.border.left.color == "FFFF0000"
+      and read_style.border.right.style == "double", "bordures relues")
+
+  local frozen_rows, frozen_cols = rs:get_frozen_panes()
+  check(frozen_rows == 1 and frozen_cols == 2, "volets figés relus")
+  check(rs:get_column_width(0) == 22, "largeur de colonne relue")
+  check(rs:get_row_height(0) == 30, "hauteur de ligne relue")
+  check(rs:get_auto_filter() == "A2:D4", "filtre automatique relu")
+
+  local external = rs:get_hyperlink(1, 0)
+  check(external and external.target == "https://example.com/?a=1&b=2"
+      and external.internal == false and external.tooltip == "Ouvrir le site",
+    "hyperlien externe relu")
+  local internal = rs:get_hyperlink(2, 0)
+  check(internal and internal.internal == true and internal.target == "'Cible'!A1",
+    "hyperlien interne relu")
+
+  local temp = xlsx.new():add_sheet("x")
+  temp:merge_cells(0, 0, 0, 1)
+  temp:unmerge_cells("A1:B1")
+  check(pcall(function() temp:merge_cells("A1:B1") end), "fusion après unmerge possible")
+  expect_error(function() temp:merge_cells("B1:C1") end, "chevauchement de fusions refusé")
+  expect_error(function() xlsx.new():add_sheet("x"):merge_cells("A1:A1") end,
+    "fusion d'une seule cellule refusée")
+  expect_error(function() xlsx.style({ font_size = 0 }) end, "taille de police invalide refusée")
+  expect_error(function()
+    xlsx.style({ border = { left = { style = "zigzag" } } })
+  end, "style de bordure inconnu refusé")
+  expect_error(function() xlsx.hyperlink("", "vide") end, "cible d'hyperlien vide refusée")
+  expect_error(function() xlsx.formula("A1", {}) end, "cache de formule invalide refusé")
 end
 
 os.remove(TMP)

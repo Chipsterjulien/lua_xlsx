@@ -4,14 +4,14 @@ Reference for the `xlsx` and `dataframe` modules. Babet with Lua 5.5 is the
 primary target, while the pure-Lua core remains compatible with standard Lua
 5.3+.
 
-Documentation for lua-xlsx 1.1.0.
+Documentation for lua-xlsx 1.2.0.
 
 ## Contents
 
 - [Architecture and Babet integration](#architecture-and-babet-integration)
 - [Conventions](#conventions)
 - [Writing XLSX files](#writing-xlsx-files)
-- [Styles, layout and formulas](#styles-layout-and-formulas)
+- [Styles, structure, layout, hyperlinks and formulas](#styles-structure-layout-hyperlinks-and-formulas)
 - [1900 and 1904 dates](#1900-and-1904-dates)
 - [Reading XLSX files](#reading-xlsx-files)
 - [ZIP validation and limits](#zip-validation-and-limits)
@@ -136,78 +136,86 @@ sh:write_rows({
 })
 ```
 
-## Styles, layout and formulas
+## Styles, structure, layout, hyperlinks and formulas
 
-The APIs in this section affect writing. The reader returns cell values but
-does not yet expose styles, dimensions, filters, frozen panes or formula
-expressions.
+Version 1.2.0 writes these elements and also exposes the supported subset
+through the reading API. `style`, `formula`, and `hyperlink` objects are
+immutable.
 
 ### `xlsx.VERSION`
 
 ```lua
-assert(xlsx.VERSION == "1.1.0")
+assert(xlsx.VERSION == "1.2.0")
 ```
 
 ### `xlsx.style([opts]) -> style`
 
-Creates an immutable reusable style. `sheet:write()` rejects raw option tables;
-styles must be created through this constructor.
+A style must be created with `xlsx.style`; raw option tables are rejected by
+`write()` and `set_style()`.
 
 | Option | Type | Values |
 |---|---|---|
 | `bold` | boolean | bold font |
 | `italic` | boolean | italic font |
-| `font_color` | string | RGB `RRGGBB`, `#RRGGBB` or ARGB `AARRGGBB` |
+| `underline` | string | `none`, `single`, `double` |
+| `strike` | boolean | strikethrough |
+| `font_name` | string | non-empty UTF-8 name, up to 255 bytes |
+| `font_size` | number | 1 to 409 points |
+| `font_color` | string | RGB `RRGGBB`, `#RRGGBB`, or ARGB `AARRGGBB` |
 | `fill_color` | string | solid RGB or ARGB fill |
 | `horizontal` | string | `left`, `center`, `right`, `justify` |
 | `vertical` | string | `top`, `center`, `bottom`, `justify` |
-| `wrap_text` | boolean | automatic text wrapping |
-| `number_format` | string | documented alias or Excel format code |
+| `wrap_text` | boolean | wrap text |
+| `number_format` | string | alias or Excel format code |
+| `border` | table | `left`, `right`, `top`, `bottom` sides |
 
 Six-digit RGB colors automatically receive an opaque `FF` alpha channel.
 
-Bold font:
+Bold and italic:
 
 ```lua
-local bold = xlsx.style({ bold = true })
-sh:write(0, 0, "Important", bold)
+local emphasis = xlsx.style({ bold = true, italic = true })
+sh:write(0, 0, "Important", emphasis)
 ```
 
-Italic colored font:
+Font name and size:
 
 ```lua
-local note = xlsx.style({
-  italic = true,
-  font_color = "7F6000",
+local title = xlsx.style({
+  font_name = "Liberation Sans",
+  font_size = 16,
 })
-sh:write(1, 0, "Note", note)
+sh:write(1, 0, "Title", title)
 ```
 
-Solid fill:
+Underlining and strikethrough:
 
 ```lua
-local warning = xlsx.style({ fill_color = "FFF2CC" })
-sh:write(2, 0, "Warning", warning)
+sh:write(2, 0, "Single", xlsx.style({ underline = "single" }))
+sh:write(3, 0, "Double", xlsx.style({ underline = "double" }))
+sh:write(4, 0, "Old value", xlsx.style({ strike = true }))
 ```
 
-Horizontal alignment:
+Font and fill colors:
 
 ```lua
-local centered = xlsx.style({ horizontal = "center" })
-sh:write(3, 0, "Centered", centered)
+local colored = xlsx.style({
+  font_color = "FFFFFF",
+  fill_color = "4472C4",
+})
 ```
 
-Vertical alignment and wrapping:
+Alignment and wrapping:
 
 ```lua
 local wrapped = xlsx.style({
+  horizontal = "center",
   vertical = "center",
   wrap_text = true,
 })
-sh:write(4, 0, "Long text split over several lines", wrapped)
 ```
 
-Built-in number-format aliases:
+Number-format aliases:
 
 | Alias | Generated Excel code |
 |---|---|
@@ -220,8 +228,6 @@ Built-in number-format aliases:
 | `date` | `yyyy-mm-dd` |
 | `datetime` | `yyyy-mm-dd hh:mm:ss` |
 
-One example per common format:
-
 ```lua
 sh:write(0, 1, 42, xlsx.style({ number_format = "integer" }))
 sh:write(1, 1, 3.14159, xlsx.style({ number_format = "decimal" }))
@@ -229,173 +235,170 @@ sh:write(2, 1, 0.125, xlsx.style({ number_format = "percent" }))
 sh:write(3, 1, 19.90, xlsx.style({ number_format = "currency_eur" }))
 ```
 
-Custom Excel format codes are accepted:
+Custom code:
 
 ```lua
-local weight = xlsx.style({ number_format = '0.000 "kg"' })
-sh:write(4, 1, 12.3456, weight)
+sh:write(4, 1, 12.3456, xlsx.style({ number_format = '0.000 "kg"' }))
 ```
 
-`xlsx.date` and `xlsx.datetime` automatically add their date format when the
-provided style has no `number_format`. This allows font and fill styling without
-losing date semantics:
+Date values automatically receive a date format if the style does not specify
+one.
+
+#### Borders
+
+Each side is a table with `style` and optional `color`. Supported styles are
+`thin`, `medium`, `thick`, `dashed`, `dotted`, and `double`.
 
 ```lua
-local date_bold = xlsx.style({ bold = true })
-sh:write(0, 2, xlsx.date(2026, 7, 18), date_bold)
-```
-
-Combined header style:
-
-```lua
-local header = xlsx.style({
-  bold = true,
-  font_color = "FFFFFF",
-  fill_color = "4472C4",
-  horizontal = "center",
-  vertical = "center",
-  wrap_text = true,
+local framed = xlsx.style({
+  border = {
+    left = { style = "thin", color = "808080" },
+    right = { style = "thin", color = "808080" },
+    top = { style = "double", color = "000000" },
+    bottom = { style = "double", color = "000000" },
+  },
 })
-sh:append_row({ "Product", "Price", "Date" }, header)
 ```
+
+### `xlsx.is_style(value)` and `xlsx.style_options(style)`
+
+```lua
+assert(xlsx.is_style(framed))
+local opts = xlsx.style_options(framed)
+```
+
+`style_options()` returns a deep copy.
 
 ### `sheet:set_style(row, col, style) -> sheet`
 
-Applies a style after writing, or to an empty cell:
-
 ```lua
-sh:write(0, 0, "Title")
 sh:set_style(0, 0, xlsx.style({ bold = true }))
 sh:set_style(1, 0, xlsx.style({ fill_color = "E2F0D9" }))
-```
-
-Passing `nil` removes the recorded style:
-
-```lua
 sh:set_style(0, 0, nil)
 ```
 
-### `sheet:set_column_width(col, width) -> sheet`
-
-`col` is 0-based. Width must be finite and between `0.1` and `255` Excel units.
+### Column widths and row heights
 
 ```lua
-sh:set_column_width(0, 24)
-sh:set_column_width(1, 14)
+sh:set_column_width(0, 24) -- 0.1 to 255
+sh:set_row_height(0, 28)   -- 0.1 to 409.5 points
 ```
 
-### `sheet:set_row_height(row, height) -> sheet`
-
-`row` is 0-based. Height is measured in points and must be between `0.1` and
-`409.5`.
+### Frozen panes
 
 ```lua
-sh:set_row_height(0, 28)
+sh:freeze_panes(1, 0)
+sh:freeze_panes(0, 1)
+sh:freeze_panes(1, 1)
+sh:freeze_panes(0, 0)
 ```
 
-### `sheet:freeze_panes(rows, cols) -> sheet`
-
-`rows` and `cols` are the counts kept visible from the top-left corner.
-
-Freeze the first row:
-
-```lua
-sh:freeze_panes(1, 0) -- first free cell: A2
-```
-
-Freeze the first column:
-
-```lua
-sh:freeze_panes(0, 1) -- first free cell: B1
-```
-
-Freeze both:
-
-```lua
-sh:freeze_panes(1, 1) -- first free cell: B2
-```
-
-`freeze_panes(0, 0)` clears the setting.
-
-### `sheet:set_auto_filter([range]) -> sheet`
-
-Without an argument, the used range is selected when the workbook is saved:
+### Automatic filters
 
 ```lua
 sh:set_auto_filter()
-```
-
-An explicit rectangular A1 range is also accepted:
-
-```lua
 sh:set_auto_filter("A1:D100")
-```
-
-Passing `false` disables the filter:
-
-```lua
 sh:set_auto_filter(false)
 ```
 
-This adds Excel filter buttons; it does not remove or hide rows itself.
+### Merged cells
 
-### `xlsx.formula(expression) -> formula`
+```lua
+sh:write(0, 0, "Report")
+sh:merge_cells("A1:D1")
+sh:merge_cells(2, 0, 2, 3) -- A3:D3, zero-based coordinates
+sh:unmerge_cells("A1:D1")
+```
 
-Creates a formula for writing. A leading `=` is optional:
+Single-cell, reversed, and overlapping merges are rejected. Only the top-left
+cell keeps its value, style, and hyperlink.
+
+### Hyperlinks
+
+External hyperlink value:
+
+```lua
+sh:write(0, 0, xlsx.hyperlink(
+  "https://example.com/?a=1&b=2",
+  "Open website",
+  { tooltip = "External website" }
+))
+```
+
+Internal hyperlink:
+
+```lua
+sh:write(1, 0, xlsx.hyperlink(
+  "'Details'!A1",
+  "View details",
+  { internal = true }
+))
+```
+
+Apply or remove a hyperlink on an existing cell:
+
+```lua
+sh:write(2, 0, "Documentation")
+sh:set_hyperlink(2, 0, "https://example.com/docs")
+sh:set_hyperlink(3, 0, "'Summary'!B2", { internal = true })
+sh:remove_hyperlink(2, 0)
+```
+
+### Formulas
 
 ```lua
 sh:write(3, 1, xlsx.formula("SUM(B1:B3)"))
 sh:write(3, 2, xlsx.formula("=AVERAGE(C1:C3)"))
+sh:write(4, 1, xlsx.formula("SUM(B2:B4)", 42.5))
 ```
 
-lua-xlsx stores the formula but does not calculate it and does not write a
-cached result. Excel, LibreOffice or another spreadsheet application calculates
-it when opening the workbook. A `data_only` reader may therefore see `nil`
-until a spreadsheet program recalculates and saves the file.
+The optional cached value may be a string, number, or boolean. It is not
+verified against the formula. lua-xlsx does not calculate formulas.
 
-A formula accepts the same optional style as any other value:
-
-```lua
-local money = xlsx.style({ number_format = "currency_eur" })
-sh:write(10, 3, xlsx.formula("SUM(D2:D10)"), money)
-```
-
-### Complete formatted report
+### Complete 1.2.0 example
 
 ```lua
 local xlsx = require("xlsx")
-
 local wb = xlsx.new()
 local sh = wb:add_sheet("Sales")
 
-local header = xlsx.style({
+local title = xlsx.style({
   bold = true,
+  underline = "double",
+  font_name = "Liberation Sans",
+  font_size = 16,
   font_color = "FFFFFF",
   fill_color = "4472C4",
   horizontal = "center",
-  vertical = "center",
-  wrap_text = true,
+  border = { bottom = { style = "double", color = "1F4E78" } },
+})
+local header = xlsx.style({
+  bold = true,
+  fill_color = "D9EAF7",
+  horizontal = "center",
+  border = {
+    left = { style = "thin", color = "808080" },
+    right = { style = "thin", color = "808080" },
+    top = { style = "thin", color = "808080" },
+    bottom = { style = "thin", color = "808080" },
+  },
 })
 local money = xlsx.style({ number_format = "currency_eur" })
 
-sh:append_row({ "Product", "Price", "Quantity", "Total" }, header)
+sh:write(0, 0, "Sales report", title)
+sh:merge_cells("A1:E1")
+sh:append_row({ "Product", "Price", "Qty", "Total", "Link" }, header)
 sh:append_row({ "Keyboard", 39.90, 2 })
 sh:append_row({ "Mouse", 24.50, 3 })
-
-sh:write(1, 1, 39.90, money)
-sh:write(2, 1, 24.50, money)
-sh:write(1, 3, xlsx.formula("B2*C2"), money)
-sh:write(2, 3, xlsx.formula("B3*C3"), money)
-sh:write(3, 3, xlsx.formula("SUM(D2:D3)"), money)
-
+sh:write(2, 1, 39.90, money)
+sh:write(3, 1, 24.50, money)
+sh:write(2, 3, xlsx.formula("B3*C3", 79.80), money)
+sh:write(3, 3, xlsx.formula("B4*C4", 73.50), money)
+sh:write(2, 4, xlsx.hyperlink("https://example.com/keyboard", "Product"))
 sh:set_column_width(0, 24)
-sh:set_column_width(1, 14)
-sh:set_column_width(2, 12)
-sh:set_column_width(3, 16)
-sh:set_row_height(0, 28)
-sh:freeze_panes(1, 1)
-sh:set_auto_filter("A1:D3")
-
+sh:set_row_height(0, 30)
+sh:freeze_panes(2, 1)
+sh:set_auto_filter("A2:E4")
 assert(wb:save("sales.xlsx"))
 ```
 
@@ -506,74 +509,90 @@ automatically detects `<workbookPr date1904="1"/>`.
 
 ### `xlsx.open(path [, opts])`
 
-Opening performs:
-
-1. file-size inspection;
-2. `babet.archive.test()` validation when available;
-3. bounded in-memory loading;
-4. central and local ZIP header validation;
-5. CRC-checked extraction of the XML parts that are used;
-6. workbook, shared-string and style parsing.
-
 ```lua
 local wb, err = xlsx.open("report.xlsx")
 assert(wb, err)
 ```
 
-Disable only Babet's archive preflight:
+Opening checks file size, optionally validates the archive with Babet, verifies
+ZIP metadata and CRCs, and parses the required XML parts.
+
+### Workbook methods
 
 ```lua
-local wb, err = xlsx.open("report.xlsx", {
-  validate_archive = false,
-})
+print(wb:date_system())
+for _, name in ipairs(wb:sheet_names()) do print(name) end
+local sheet = assert(wb:sheet("Data"))
 ```
 
-The Lua ZIP checks still apply.
+`sheet()` also accepts a one-based sheet index.
 
-### `workbook:date_system()`
+### Values and formulas
 
-Returns `"1900"` or `"1904"`.
-
-### `workbook:sheet_names()`
+`sheet:read(row, col)` keeps the historical contract and returns the cached
+cell value. A formula without a cache therefore returns `nil`.
 
 ```lua
-for _, name in ipairs(wb:sheet_names()) do
-  print(name)
+local value = sheet:read(0, 0)
+local formula = sheet:get_formula(3, 1)
+if formula then
+  print(formula.expression, formula.cached_value, formula.formula_type)
 end
 ```
 
-### `workbook:sheet(which)`
+Formula objects also expose `ref` and `shared_index` when present. A secondary
+shared formula may have no resolved expression; it can be inspected but cannot
+be written directly.
 
-`which` is a name or a 1-based integer index.
+### Styles
 
 ```lua
-local first = wb:sheet(1)
-local data = wb:sheet("Data")
+local style = sheet:get_style(0, 0)
+if style then
+  print(style.bold, style.font_name, style.font_size)
+  print(style.number_format)
+  print(style.border and style.border.bottom and style.border.bottom.style)
+end
 ```
 
-Worksheets are extracted lazily and cached. A worksheet-specific corruption is
-therefore returned by `sheet()` as `nil, err`.
+The returned style may be passed to `write()` or `set_style()`. Only the
+supported subset is exposed; themes, indexed colors, diagonal borders, and
+advanced variants may be omitted.
 
-### `sheet:read(row, col)`
-
-Returns a string, number, boolean, ISO date string or `nil`. OOXML error cells
-are currently returned as strings.
-
-### `sheet:dims()`
-
-Returns maximum 0-based row and column indices, or `-1, -1` for an empty sheet.
-
-### `sheet:rows()`
+### Layout
 
 ```lua
+print(sheet:get_column_width(0))
+print(sheet:get_row_height(0))
+local rows, cols = sheet:get_frozen_panes()
+print(rows, cols)
+print(sheet:get_auto_filter())
+```
+
+### Merged cells
+
+```lua
+for _, range in ipairs(sheet:merged_cells()) do print(range) end
+```
+
+### Hyperlinks
+
+```lua
+local link = sheet:get_hyperlink(2, 4)
+if link then print(link.target, link.internal, link.tooltip, link.ref) end
+for _, item in ipairs(sheet:hyperlinks()) do print(item.ref, item.target) end
+```
+
+### Dimensions and row iteration
+
+```lua
+local maxrow, maxcol = sheet:dims()
 for row in sheet:rows() do
-  for col = 1, row.n do
-    print(row[col])
-  end
+  for col = 1, row.n do print(row[col]) end
 end
 ```
 
-Intermediate empty spreadsheet rows are yielded to preserve row numbering.
+`rows()` iterates over cached values and preserves intermediate empty rows.
 
 ---
 
@@ -810,11 +829,12 @@ temporary directory.
 
 - Writing uses STORED ZIP entries; reading supports STORED and DEFLATE.
 - The internal Lua parser does not support ZIP64.
-- No merged cells, charts, images, data validation or conditional formatting.
-- Formulas can be written, but lua-xlsx does not calculate them and does not yet
-  expose their expression while reading. Only an optional cached value is read.
-- Styles, dimensions, panes and filters are written but are not exposed by the
-  reading API.
+- No charts, images, data validation, structured tables, or conditional
+  formatting.
+- Formulas are read and written but not calculated. Secondary shared formulas
+  without a resolved expression are not written back.
+- Style reading covers the supported subset; themes, indexed colors, diagonal
+  borders, and advanced options may be omitted.
 - No streaming reader: the file and selected XML parts remain in memory.
 - The XML scanner is XLSX-specific, not a general XML parser.
 - No Unicode normalization or complete Unicode case folding for sheet names;

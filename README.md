@@ -13,10 +13,12 @@ constituent la cible principale et recommandée.
 
 - Écriture de classeurs XLSX : chaînes, nombres, booléens, dates, dates-heures,
   formules, plusieurs feuilles et cellules éparses.
-- Styles simples : gras, italique, couleurs, fond, alignement, retour à la
-  ligne et formats numériques personnalisés ou prédéfinis.
-- Mise en page : largeurs de colonnes, hauteurs de lignes, volets figés et
-  filtres automatiques.
+- Styles : gras, italique, soulignement, texte barré, police, taille,
+  couleurs, fond, alignement, retour à la ligne, bordures et formats numériques.
+- Structure et mise en page : cellules fusionnées, largeurs de colonnes,
+  hauteurs de lignes, volets figés et filtres automatiques.
+- Hyperliens externes et internes.
+- Lecture des formules, styles, dimensions, fusions, volets, filtres et liens.
 - Lecture des ZIP XLSX STORED ou DEFLATE avec un décompresseur DEFLATE Lua.
 - Contrôle du CRC-32, des tailles, des offsets, des doublons, du chiffrement,
   des chevauchements et des rapports de compression.
@@ -58,19 +60,28 @@ local sh = wb:add_sheet("Rapport")
 
 local header = xlsx.style({
   bold = true,
-  fill_color = "D9EAF7",
+  font_name = "Liberation Sans",
+  font_size = 14,
+  font_color = "FFFFFF",
+  fill_color = "4472C4",
   horizontal = "center",
+  border = {
+    bottom = { style = "double", color = "1F4E78" },
+  },
 })
 local money = xlsx.style({ number_format = "currency_eur" })
 
-sh:append_row({ "Nom", "Montant", "Date", "Total" }, header)
+sh:write(0, 0, "Rapport", header)
+sh:merge_cells("A1:D1")
+sh:append_row({ "Nom", "Montant", "Date", "Lien" }, header)
 sh:append_row({ "Alice", 12.5, xlsx.date(2026, 7, 18) })
-sh:write(1, 1, 12.5, money)
-sh:write(2, 3, xlsx.formula("SUM(B2:B2)"), money)
+sh:write(2, 1, 12.5, money)
+sh:write(2, 3, xlsx.hyperlink("https://example.com", "Ouvrir"))
+sh:write(3, 1, xlsx.formula("SUM(B3:B3)", 12.5), money)
 sh:set_column_width(0, 18)
-sh:set_row_height(0, 24)
-sh:freeze_panes(1, 1)
-sh:set_auto_filter("A1:D2")
+sh:set_row_height(0, 28)
+sh:freeze_panes(2, 1)
+sh:set_auto_filter("A2:D3")
 
 local ok, err = wb:save("rapport.xlsx")
 assert(ok, err)
@@ -97,10 +108,21 @@ for row in sh:rows() do
   end
   io.write("\n")
 end
+
+local formula = sh:get_formula(3, 1)
+if formula then
+  print(formula.expression, formula.cached_value)
+end
+
+local style = sh:get_style(0, 0)
+local frozen_rows, frozen_cols = sh:get_frozen_panes()
+print(style and style.font_name, frozen_rows, frozen_cols)
+print(table.concat(sh:merged_cells(), ", "))
 ```
 
 Les dates sont renvoyées sous forme ISO 8601, par exemple `2026-07-18` ou
-`2026-07-18T13:45:30`.
+`2026-07-18T13:45:30`. `read()` conserve la valeur mise en cache d'une formule ;
+`get_formula()` expose séparément son expression.
 
 ## DataFrame
 
@@ -200,12 +222,14 @@ fichiers Markdown. Il nécessite Pandoc et XeLaTeX ou LuaLaTeX.
 
 ## Limites actuelles
 
-- Pas de cellules fusionnées, graphiques, images, validations de données ni
+- Pas de graphiques, images, validations de données, tableaux structurés ni
   mise en forme conditionnelle.
-- Les formules peuvent être écrites, mais lua-xlsx ne les calcule pas et ne lit
-  pas encore leur expression. Seule une éventuelle valeur mise en cache est lue.
-- Les styles et réglages de présentation sont produits en écriture, mais ne sont
-  pas exposés par l'API de lecture.
+- Les formules sont lues et écrites, mais lua-xlsx ne les calcule pas. Une
+  formule partagée sans expression résolue peut être inspectée mais pas
+  réécrite directement.
+- La lecture des styles expose le sous-ensemble pris en charge par lua-xlsx ;
+  les thèmes, couleurs indexées, diagonales et variantes avancées ne sont pas
+  reproduits.
 - La lecture reste en mémoire : le ZIP, les XML utiles et les résultats
   décompressés sont chargés en RAM dans les limites configurées.
 - Le lecteur Lua ne prend pas encore en charge ZIP64. Babet peut valider un ZIP64,
